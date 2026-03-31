@@ -1,0 +1,52 @@
+SAMPLE CMD:
+/home/jongboklee/.conda/envs/fairwire/bin/python sample.py --model_path /home/jongboklee/FairWire/cora_0.1_0.0_cpts/Sync_T3.pth --num_samples 1 --gpu 0 --seed 0 --save_pt_path /home/jongboklee/FairWire/generated_graphs/three_value_smoke/generated_graphs/cora_0.1_0.0_cpts__Sync_T3__seed_0.pyg.pt --skip_internal_eval
+
+SAMPLE STDOUT:
+Loaded GraphMaker-Sync model trained on cora
+Val Nll 0.02226402164654116
+  NumNodes: 2708
+  NumEdges: 10556
+  NumFeats: 1433
+  NumClasses: 7
+  NumTrainingSamples: 140
+  NumValidationSamples: 500
+  NumTestSamples: 1000
+Done loading data from cached files.
+[Saved pt] /home/jongboklee/FairWire/generated_graphs/three_value_smoke/generated_graphs/cora_0.1_0.0_cpts__Sync_T3__seed_0.pyg.pt  (1 graphs)
+
+
+SAMPLE STDERR:
+2026-03-31 13:28:27.180656: I tensorflow/core/platform/cpu_feature_guard.cc:193] This TensorFlow binary is optimized with oneAPI Deep Neural Network Library (oneDNN) to use the following CPU instructions in performance-critical operations:  AVX2 AVX512F AVX512_VNNI AVX512_BF16 FMA
+To enable them in other operations, rebuild TensorFlow with the appropriate compiler flags.
+2026-03-31 13:28:27.275322: I tensorflow/core/util/port.cc:104] oneDNN custom operations are on. You may see slightly different numerical results due to floating-point round-off errors from different computation orders. To turn them off, set the environment variable `TF_ENABLE_ONEDNN_OPTS=0`.
+2026-03-31 13:28:27.665437: W tensorflow/compiler/xla/stream_executor/platform/default/dso_loader.cc:64] Could not load dynamic library 'libnvinfer.so.7'; dlerror: libnvinfer.so.7: cannot open shared object file: No such file or directory
+2026-03-31 13:28:27.665508: W tensorflow/compiler/xla/stream_executor/platform/default/dso_loader.cc:64] Could not load dynamic library 'libnvinfer_plugin.so.7'; dlerror: libnvinfer_plugin.so.7: cannot open shared object file: No such file or directory
+2026-03-31 13:28:27.665515: W tensorflow/compiler/tf2tensorrt/utils/py_utils.cc:38] TF-TRT Warning: Cannot dlopen some TensorRT libraries. If you would like to use Nvidia GPU with TensorRT, please make sure the missing libraries mentioned above are installed properly.
+
+  0%|          | 0/3 [00:00<?, ?it/s][W TensorAdvancedIndexing.cpp:1550] Warning: scatter_reduce() is in beta and the API may change at any time. (function operator())
+
+ 33%|███▎      | 1/3 [00:03<00:07,  3.88s/it]
+ 67%|██████▋   | 2/3 [00:07<00:03,  3.50s/it]
+100%|██████████| 3/3 [00:10<00:00,  3.37s/it]
+100%|██████████| 3/3 [00:10<00:00,  3.44s/it]
+
+
+SAMPLE RETURNCODE: 0
+
+
+EVAL CMD:
+/home/jongboklee/.conda/envs/fairwire/bin/python evaluate_generated_graphs.py --graph_path /home/jongboklee/FairWire/generated_graphs/three_value_smoke/generated_graphs/cora_0.1_0.0_cpts__Sync_T3__seed_0.pyg.pt --dataset cora --seed 0 --out_per_graph_csv /home/jongboklee/FairWire/generated_graphs/three_value_smoke/eval_outputs/cora_0.1_0.0_cpts__Sync_T3__seed_0.per_graph.csv --out_summary_csv /home/jongboklee/FairWire/generated_graphs/three_value_smoke/eval_outputs/cora_0.1_0.0_cpts__Sync_T3__seed_0.summary.csv
+
+EVAL STDOUT:
+
+
+EVAL STDERR:
+2026-03-31 13:28:43.754586: I tensorflow/core/platform/cpu_feature_guard.cc:193] This TensorFlow binary is optimized with oneAPI Deep Neural Network Library (oneDNN) to use the following CPU instructions in performance-critical operations:  AVX2 AVX512F AVX512_VNNI AVX512_BF16 FMA
+To enable them in other operations, rebuild TensorFlow with the appropriate compiler flags.
+2026-03-31 13:28:43.853284: I tensorflow/core/util/port.cc:104] oneDNN custom operations are on. You may see slightly different numerical results due to floating-point round-off errors from different computation orders. To turn them off, set the environment variable `TF_ENABLE_ONEDNN_OPTS=0`.
+2026-03-31 13:28:44.305447: W tensorflow/compiler/xla/stream_executor/platform/default/dso_loader.cc:64] Could not load dynamic library 'libnvinfer.so.7'; dlerror: libnvinfer.so.7: cannot open shared object file: No such file or directory
+2026-03-31 13:28:44.305523: W tensorflow/compiler/xla/stream_executor/platform/default/dso_loader.cc:64] Could not load dynamic library 'libnvinfer_plugin.so.7'; dlerror: libnvinfer_plugin.so.7: cannot open shared object file: No such file or directory
+2026-03-31 13:28:44.305529: W tensorflow/compiler/tf2tensorrt/utils/py_utils.cc:38] TF-TRT Warning: Cannot dlopen some TensorRT libraries. If you would like to use Nvidia GPU with TensorRT, please make sure the missing libraries mentioned above are installed properly.
+
+
+EVAL RETURNCODE: 0
