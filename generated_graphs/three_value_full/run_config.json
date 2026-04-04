@@ -2,6 +2,7 @@
   "repo_dir": "/home/jongboklee/FairWire",
   "python_exec": "/home/jongboklee/.conda/envs/fairwire/bin/python",
   "model_paths": [
+    "/home/jongboklee/FairWire/cora_0.01_0.0_cpts/Sync_T3.pth",
     "/home/jongboklee/FairWire/cora_0.05_0.0_cpts/Sync_T3.pth",
     "/home/jongboklee/FairWire/cora_0.1_0.0_cpts/Sync_T3.pth",
     "/home/jongboklee/FairWire/cora_1.0_0.0_cpts/Sync_T3.pth"
@@ -12,7 +13,8 @@
   "seeds": [
     0,
     1,
-    2
+    2,
+    3
   ],
   "plot_x_metric": "lp/score_sp_abs_gap_mean",
   "plot_y_metric": "lp/auc_mean",
@@ -24,6 +26,8 @@
     "gcn",
     "--lp_epochs",
     "200",
+    "--lp_test_ratio",
+    "0.2",
     "--sensitive_attr",
     "y",
     "--sensitive_value",
