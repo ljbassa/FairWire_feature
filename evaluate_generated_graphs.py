@@ -23,7 +23,7 @@ import pickle
 import random
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import networkx as nx
 import numpy as np
@@ -169,11 +169,10 @@ def get_local_sensitive_vector(data: Data, sensitive_attr: str, sensitive_value:
         raise ValueError(f"data.{sensitive_attr} is None")
     if s.dim() > 1:
         s = s.squeeze()
-    if sensitive_value is None:
-        if s.dtype == torch.bool:
-            return s.long()
-        return (s != 0).long()
-    return (s == sensitive_value).long()
+    # Legacy naming is kept for CSV/CLI compatibility. Fairness groups are now
+    # defined by same-label vs different-label pairs over this node attribute.
+    _ = sensitive_value
+    return s.detach().cpu()
 
 
 def pair_sensitive_mask_from_local_pairs(
@@ -181,15 +180,12 @@ def pair_sensitive_mask_from_local_pairs(
     local_sensitive: torch.Tensor,
     mode: str = "either",
 ) -> np.ndarray:
-    local_sensitive = local_sensitive.detach().cpu().bool()
+    _ = mode
     mask = []
     for u, v in pairs:
-        su = bool(local_sensitive[int(u)].item())
-        sv = bool(local_sensitive[int(v)].item())
-        if mode == "both":
-            mask.append(su and sv)
-        else:
-            mask.append(su or sv)
+        su = local_sensitive[int(u)].item()
+        sv = local_sensitive[int(v)].item()
+        mask.append(su == sv)
     return np.asarray(mask, dtype=bool)
 
 
@@ -246,18 +242,16 @@ def load_reference_graph_from_dataset(graph_path: str, dataset: str) -> nx.Graph
     return g_ref
 
 
-def build_reference_node_sensitive_map(g_ref: nx.Graph, sensitive_attr: str, sensitive_value: Optional[int]) -> Dict[int, bool]:
-    out: Dict[int, bool] = {}
+def build_reference_node_sensitive_map(g_ref: nx.Graph, sensitive_attr: str, sensitive_value: Optional[int]) -> Dict[int, Any]:
+    out: Dict[int, Any] = {}
     for n, attrs in g_ref.nodes(data=True):
         if sensitive_attr not in attrs:
             raise KeyError(f"Reference graph node {n} lacks attr {sensitive_attr!r}")
         val = attrs[sensitive_attr]
         if hasattr(val, "item"):
             val = val.item()
-        if sensitive_value is None:
-            out[int(n)] = bool(val)
-        else:
-            out[int(n)] = bool(val == sensitive_value)
+        _ = sensitive_value
+        out[int(n)] = val
     return out
 
 
@@ -303,15 +297,13 @@ def build_fixed_eval_pairs(g_ref: nx.Graph, max_pos_edges: int = 20000, neg_rati
     return pairs, labels
 
 
-def pair_sensitive_mask(pairs: Sequence[Tuple[int, int]], node_sensitive: Dict[int, bool], mode: str = "either") -> np.ndarray:
+def pair_sensitive_mask(pairs: Sequence[Tuple[int, int]], node_sensitive: Dict[int, Any], mode: str = "either") -> np.ndarray:
+    _ = mode
     mask = []
     for u, v in pairs:
         su = node_sensitive[int(u)]
         sv = node_sensitive[int(v)]
-        if mode == "both":
-            mask.append(su and sv)
-        else:
-            mask.append(su or sv)
+        mask.append(su == sv)
     return np.asarray(mask, dtype=bool)
 
 
@@ -323,7 +315,7 @@ def edge_overlap_on_fixed_pairs(
     data: Data,
     reference_pairs: Sequence[Tuple[int, int]],
     reference_labels: np.ndarray,
-    reference_node_sensitive: Dict[int, bool],
+    reference_node_sensitive: Dict[int, Any],
     edge_sensitive_mode: str,
 ) -> Tuple[Dict[str, float], Dict[str, np.ndarray]]:
     _gids, g2l = global_id_mapping(data)
@@ -961,7 +953,7 @@ def evaluate_lp_on_fixed_pairs(
     train_mp_edge_index: torch.Tensor,
     reference_pairs: Sequence[Tuple[int, int]],
     reference_labels: np.ndarray,
-    reference_node_sensitive: Dict[int, bool],
+    reference_node_sensitive: Dict[int, Any],
     edge_sensitive_mode: str,
     threshold: float,
     device: str,
@@ -1033,9 +1025,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--graph_index", type=int, default=None, help="Optional: evaluate only one graph from the saved list")
     p.add_argument("--seed", type=int, default=0)
 
-    p.add_argument("--sensitive_attr", type=str, default="y")
-    p.add_argument("--sensitive_value", type=int, default=3)
-    p.add_argument("--edge_sensitive_mode", type=str, default="either", choices=["either", "both"])
+    p.add_argument("--sensitive_attr", type=str, default="y",
+                   help="Node attribute used to define same-label vs different-label pair groups.")
+    p.add_argument("--sensitive_value", type=int, default=None,
+                   help="Legacy no-op retained for backward compatibility.")
+    p.add_argument("--edge_sensitive_mode", type=str, default="either", choices=["either", "both"],
+                   help="Legacy no-op retained for backward compatibility.")
 
     p.add_argument("--max_pos_edges", type=int, default=20000, help="Max positive reference edges for overlap/reference LP pairs")
     p.add_argument("--neg_ratio", type=float, default=1.0, help="Neg/pos ratio for fixed reference pairs")

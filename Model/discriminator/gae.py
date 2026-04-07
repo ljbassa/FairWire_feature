@@ -47,30 +47,34 @@ class GAETrainer(BaseTrainer):
 
         return A_train, Z, A_full_dense
 
-    def fairness_metrics(self, Y, preds, s):
-        idx_s0 = s==0
-        idx_s1 = s==1
-        
-        idx_s0_y1 = np.bitwise_and(idx_s0, Y==1)
-        idx_s1_y1 = np.bitwise_and(idx_s1, Y==1)
-        
-        parity = abs(sum(preds[idx_s0])/sum(idx_s0)-sum(preds[idx_s1])/sum(idx_s1))
-        equality = abs(sum(preds[idx_s0_y1])/sum(idx_s0_y1)-sum(preds[idx_s1_y1])/sum(idx_s1_y1))
+    def _safe_group_mean(self, values, mask):
+        denom = np.sum(mask)
+        if denom == 0:
+            return np.nan
+        return float(np.sum(values[mask]) / denom)
 
+    def fairness_metrics(self, labels, preds, pair_same_mask):
+        idx_same = np.asarray(pair_same_mask, dtype=bool)
+        idx_diff = ~idx_same
+
+        idx_same_y1 = np.bitwise_and(idx_same, labels == 1)
+        idx_diff_y1 = np.bitwise_and(idx_diff, labels == 1)
+
+        parity = abs(self._safe_group_mean(preds, idx_same) - self._safe_group_mean(preds, idx_diff))
+        equality = abs(self._safe_group_mean(preds, idx_same_y1) - self._safe_group_mean(preds, idx_diff_y1))
         return parity, equality
 
     @torch.no_grad()
-    def predict_fit(self, A, Z, s, A_dense, mask, model):
+    def predict_fit(self, A, Z, group_labels, A_dense, mask, model):
         model.eval()
         Z_out = model(A, Z)
-        s_one_hot = (F.one_hot(s, num_classes=len(torch.unique(s))).float()).cpu().numpy()
-        sens = np.matmul(s_one_hot, s_one_hot.T)
-        sens = sens[mask]
+        group_labels = group_labels.to(Z_out.device)
+        pair_same = (group_labels.unsqueeze(1) == group_labels.unsqueeze(0))[mask].cpu().numpy()
         prob = torch.sigmoid(Z_out @ Z_out.T)[mask].cpu().numpy()
         
         label = A_dense[mask].cpu().numpy()
         
-        sp, eo = self.fairness_metrics(label, prob, sens)
+        sp, eo = self.fairness_metrics(label, prob, pair_same)
         return roc_auc_score(label, prob), sp, eo
 
     @torch.no_grad()
@@ -81,18 +85,18 @@ class GAETrainer(BaseTrainer):
         model = self.model
         model.eval()
         Z_out = model(A_train, Z)
-        s_one_hot = (F.one_hot(s, num_classes=len(torch.unique(s))).float()).cpu().numpy()
-        sens = np.matmul(s_one_hot, s_one_hot.T)
-        sens = sens[mask]
+        group_labels = Y if Y is not None else s
+        group_labels = group_labels.to(Z_out.device)
+        pair_same = (group_labels.unsqueeze(1) == group_labels.unsqueeze(0))[mask].cpu().numpy()
         prob = torch.sigmoid(Z_out @ Z_out.T)[mask].cpu().numpy()
         label = A_full_dense[mask].cpu().numpy()
 
-        sp, eo = self.fairness_metrics(label, prob, sens)
+        sp, eo = self.fairness_metrics(label, prob, pair_same)
         return roc_auc_score(label, prob), sp, eo
     def fit_trial(self,
                   A_train,
                   Z,
-                  s,
+                  group_labels,
                   A_full_dense,
                   train_mask,
                   val_mask,
@@ -149,7 +153,7 @@ class GAETrainer(BaseTrainer):
             loss.backward()
             optimizer.step()
 
-            auc, sp, eo = self.predict_fit(A_train, Z, s, A_full_dense, val_mask, model)
+            auc, sp, eo = self.predict_fit(A_train, Z, group_labels, A_full_dense, val_mask, model)
 
             if auc > best_auc:
                 num_patient_epochs = 0
@@ -189,6 +193,7 @@ class GAETrainer(BaseTrainer):
         self.num_classes = num_classes
         A_train, Z, A_full_dense = self.preprocess(
             A_train, A_full, X, s, Y)
+        group_labels = Y if Y is not None else s
 
         config_list = self.get_config_list()
 
@@ -200,7 +205,7 @@ class GAETrainer(BaseTrainer):
             for config in tconfig:
                 trial_auc, trial_sp, trial_eo, trial_model = self.fit_trial(A_train,
                                                                             Z,
-                                                                            s,
+                                                                            group_labels,
                                                                             A_full_dense,
                                                                             train_mask,
                                                                             val_mask,

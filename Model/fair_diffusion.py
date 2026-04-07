@@ -160,14 +160,14 @@ class FairLossE(nn.Module):
         logit_E : torch.Tensor of shape (B, 2)
             Predicted logits for the edge existence.
         M_chi: torch.Tensor of shape (B)
-            A boolean mask for inter-edges
+            Weight mask for one pair group.
         M_omega: torch.Tensor of shape (B)
-            A boolean mask for intra-edges
+            Weight mask for the complementary pair group.
 
         Returns
         -------
         fair_loss_E : torch.Tensor
-            Scalar representing the fairness loss defined for inter/intra edges .
+            Scalar representing the fairness loss between pair groups.
         """
         
         fair_loss_E = torch.pow(torch.sum(logit_E[:,1] * M_chi) - torch.sum(logit_E[:,1] * M_omega),2)
@@ -744,15 +744,13 @@ class ModelSync(BaseModel):
         fair_loss_X = self.fair_loss_X(X_one_hot_3d, logit_X, self.p_values)
         loss_E = self.loss_E(batch_E_one_hot, logit_E)
         batch_pred_E = logit_E.softmax(dim=-1)
-        s_one_hot = F.one_hot(s, num_classes=self.num_classes_s).float()
-        N = len(s)
-        fair_loss_E = 0
-        for i, k in enumerate(torch.unique(s[batch_src])):
-            e_k = torch.zeros(self.num_classes_s, 1).to(s_one_hot.device)
-            e_k[k]=1
-            se_k = torch.matmul(s_one_hot, e_k)
-            sum_sek = torch.sum(se_k)
-            fair_loss_E += self.fair_loss_E(batch_pred_E, torch.matmul(se_k, se_k.T)[batch_src,batch_dst]/sum_sek, torch.matmul(se_k, (torch.ones(N,1).to(s_one_hot.device) - se_k).T)[batch_src,batch_dst]/(N - sum_sek))
+        group_labels = y if y is not None else s
+        pair_same_mask = (group_labels[batch_src] == group_labels[batch_dst]).float()
+        pair_diff_mask = 1.0 - pair_same_mask
+        fair_loss_E = self.fair_loss_E(
+            batch_pred_E,
+            pair_same_mask / pair_same_mask.sum().clamp_min(1.0),
+            pair_diff_mask / pair_diff_mask.sum().clamp_min(1.0))
         return loss_X, fair_loss_X, loss_E, fair_loss_E
 
     def denoise_match_X(self,

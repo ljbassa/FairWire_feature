@@ -357,9 +357,12 @@ def parse_args():
     p.add_argument("--gen_device", type=str, default="cuda:0")
     p.add_argument("--lp_device", type=str, default="cuda:0")
 
-    p.add_argument("--fair_sensitive_attr", type=str, default="y")
-    p.add_argument("--fair_sensitive_value", type=int, default=None)
-    p.add_argument("--fair_edge_sensitive_mode", type=str, default="either", choices=["either", "both"])
+    p.add_argument("--fair_sensitive_attr", type=str, default="y",
+                   help="Node attribute used to define same-label vs different-label pair groups.")
+    p.add_argument("--fair_sensitive_value", type=int, default=None,
+                   help="Legacy no-op retained for backward compatibility.")
+    p.add_argument("--fair_edge_sensitive_mode", type=str, default="either", choices=["either", "both"],
+                   help="Legacy no-op retained for backward compatibility.")
 
     p.add_argument("--largest_cc", type=str2bool, default=False)
     p.add_argument("--save_full_graph", action="store_true")

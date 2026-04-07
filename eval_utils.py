@@ -398,6 +398,7 @@ class Evaluator:
                 f"{model_dir}/cn.pth",
                 A_train=A_real_train,
                 s=s_real,
+                Y=Y_real,
                 A_full=A_real,
                 val_mask=val_mask,
                 test_mask=test_mask
@@ -763,6 +764,7 @@ class Evaluator:
             self.cn_evaluator.add_sample(
                 A_train=A_sample_train,
                 s=s_sample,
+                Y=Y_sample,
                 A_full=A_sample,
                 val_mask=val_mask,
                 test_mask=test_mask

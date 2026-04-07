@@ -50,20 +50,25 @@ class CN(nn.Module):
         self.best_threshold = nn.Parameter(
             thresholds[np.argmax(acc_list)], requires_grad=False)
     
-    def fairness_metrics(self, Y, preds, s):
-        idx_s0 = s==0
-        idx_s1 = s==1
-        
-        idx_s0_y1 = np.bitwise_and(idx_s0, Y==1)
-        idx_s1_y1 = np.bitwise_and(idx_s1, Y==1)
-        
-        parity = abs(sum(preds[idx_s0])/sum(idx_s0)-sum(preds[idx_s1])/sum(idx_s1))
-        equality = abs(sum(preds[idx_s0_y1])/sum(idx_s0_y1)-sum(preds[idx_s1_y1])/sum(idx_s1_y1))
+    def _safe_group_mean(self, values, mask):
+        denom = np.sum(mask)
+        if denom == 0:
+            return np.nan
+        return float(np.sum(values[mask]) / denom)
 
+    def fairness_metrics(self, labels, preds, pair_same_mask):
+        idx_same = np.asarray(pair_same_mask, dtype=bool)
+        idx_diff = ~idx_same
+
+        idx_same_y1 = np.bitwise_and(idx_same, labels == 1)
+        idx_diff_y1 = np.bitwise_and(idx_diff, labels == 1)
+
+        parity = abs(self._safe_group_mean(preds, idx_same) - self._safe_group_mean(preds, idx_diff))
+        equality = abs(self._safe_group_mean(preds, idx_same_y1) - self._safe_group_mean(preds, idx_diff_y1))
         return parity, equality
     
         
-    def predict(self, A_train, A_full, s, mask):
+    def predict(self, A_train, A_full, s, mask, Y=None):
         A_train = A_train.to_dense()
         A_full = A_full.to_dense()
 
@@ -71,10 +76,9 @@ class CN(nn.Module):
         label = A_full[src, dst]
         label[label != 0] = 1
         label = label.cpu()
-        
-        s_one_hot = (F.one_hot(s, num_classes=len(torch.unique(s))).float()).cpu().numpy()
-        sens = np.matmul(s_one_hot, s_one_hot.T)
-        sens = sens[src, dst]
+
+        group_labels = Y if Y is not None else s
+        pair_same = (group_labels[src] == group_labels[dst]).cpu().numpy()
         A_train[A_train != 0.] = 1.
 
         num_batches = len(src) // self.batch_size
@@ -98,7 +102,7 @@ class CN(nn.Module):
 
         pred = torch.cat(pred_list)
         with torch.no_grad():
-            sp, eo = self.fairness_metrics(label.numpy(), pred.cpu().numpy(), sens)
+            sp, eo = self.fairness_metrics(label.numpy(), pred.cpu().numpy(), pair_same)
         return (pred == label).float().mean().item(), sp, eo
 
 class CNEvaluator:
@@ -106,12 +110,14 @@ class CNEvaluator:
                  model_path,
                  A_train,
                  s,
+                 Y,
                  A_full,
                  val_mask,
                  test_mask):
         self.real_A_train = A_train
         self.real_A_full = A_full
         self.real_s = s
+        self.real_Y = Y
         self.real_test_mask = test_mask
 
         self.sample_sample_acc = []
@@ -123,7 +129,7 @@ class CNEvaluator:
             self.model_real.fit(A_train, A_full, val_mask)
             torch.save(self.model_real.state_dict(), model_path)
 
-        self.real_real_acc, self.real_real_sp, self.real_real_eo = self.model_real.predict(A_train, A_full, s, test_mask)
+        self.real_real_acc, self.real_real_sp, self.real_real_eo = self.model_real.predict(A_train, A_full, s, test_mask, Y=Y)
 
         self.real_sample_acc = []
         self.sample_real_acc = []
@@ -140,11 +146,12 @@ class CNEvaluator:
     def add_sample(self,
                    A_train,
                    s,
+                   Y,
                    A_full,
                    val_mask,
                    test_mask):
         
-        real_sample_acc, real_sample_sp, real_sample_eo = self.model_real.predict(A_train, A_full, s, test_mask)
+        real_sample_acc, real_sample_sp, real_sample_eo = self.model_real.predict(A_train, A_full, s, test_mask, Y=Y)
         self.real_sample_acc.append(real_sample_acc)
         self.real_sample_sp.append(real_sample_sp)
         self.real_sample_eo.append(real_sample_eo)
@@ -156,13 +163,14 @@ class CNEvaluator:
                 self.real_A_train,
                 self.real_A_full,
                 self.real_s,
-                self.real_test_mask)
+                self.real_test_mask,
+                Y=self.real_Y)
         self.sample_real_acc.append(sample_real_acc)
         self.sample_real_sp.append(sample_real_sp)
         self.sample_real_eo.append(sample_real_eo)
         
         
-        sample_sample_acc, sample_sample_sp, sample_sample_eo = model_sample.predict(A_train, A_full, s, test_mask)
+        sample_sample_acc, sample_sample_sp, sample_sample_eo = model_sample.predict(A_train, A_full, s, test_mask, Y=Y)
         self.sample_sample_acc.append(sample_sample_acc)
         self.sample_sample_sp.append(sample_sample_sp)
         self.sample_sample_eo.append(sample_sample_eo)
