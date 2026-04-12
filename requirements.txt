@@ -1,3 +1,5 @@
+--find-links https://data.dgl.ai/wheels/cu116/repo.html
+
 protobuf==3.19.6
 
 absl-py==1.4.0
