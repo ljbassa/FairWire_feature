@@ -907,7 +907,13 @@ class ModelSync(BaseModel):
             log_p_0_E, fair_loss_E, log_p_0_X, fair_loss_X
 
     @torch.no_grad()
-    def sample(self, is_diff_X=True, batch_size=32768, num_workers=4):
+    def sample(self,
+               is_diff_X=True,
+               batch_size=32768,
+               num_workers=4,
+               fixed_X_one_hot_3d=None,
+               fixed_s=None,
+               fixed_y=None):
         """Sample a graph.
 
         Parameters
@@ -916,6 +922,12 @@ class ModelSync(BaseModel):
             Batch size for edge prediction.
         num_workers : int
             Number of subprocesses for data loading in edge prediction.
+        fixed_X_one_hot_3d : torch.Tensor of shape (F, |V|, 2), optional
+            Node features to keep aligned with original node IDs.
+        fixed_s : torch.Tensor of shape (|V|), optional
+            Sensitive/group labels to keep aligned with original node IDs.
+        fixed_y : torch.Tensor of shape (|V|), optional
+            Task labels to keep aligned with original node IDs.
 
         Returns
         -------
@@ -927,6 +939,19 @@ class ModelSync(BaseModel):
             Adjacency matrix of the generated graph.
         """
         device = self.X_marginal.device
+        if fixed_X_one_hot_3d is not None:
+            fixed_X_one_hot_3d = fixed_X_one_hot_3d.to(device).float()
+            if fixed_X_one_hot_3d.size(1) != self.num_nodes:
+                raise ValueError("fixed_X_one_hot_3d has a different number of nodes.")
+        if fixed_s is not None:
+            fixed_s = fixed_s.to(device).long()
+            if fixed_s.size(0) != self.num_nodes:
+                raise ValueError("fixed_s has a different number of nodes.")
+        if fixed_y is not None:
+            fixed_y = fixed_y.to(device).long()
+            if fixed_y.size(0) != self.num_nodes:
+                raise ValueError("fixed_y has a different number of nodes.")
+
         dst, src = torch.triu_indices(self.num_nodes, self.num_nodes,
                                       offset=1, device=device)
         # (|E|)
@@ -940,14 +965,20 @@ class ModelSync(BaseModel):
 
         # Sample G^T from prior distribution.
         # (|V|, C)
-        s_prior = self.s_marginal[None, :].expand(self.num_nodes, -1)
-        s_0 = s_prior.multinomial(1).reshape(-1)
-        y_0 = torch.zeros(len(s_0), device = s_0.device)
-        if self.y_cond_s_marginal is not None:
+        if fixed_s is not None:
+            s_0 = fixed_s
+        else:
+            s_prior = self.s_marginal[None, :].expand(self.num_nodes, -1)
+            s_0 = s_prior.multinomial(1).reshape(-1)
+
+        if fixed_y is not None:
+            y_0 = fixed_y
+        elif self.y_cond_s_marginal is not None:
+            y_0 = torch.zeros(len(s_0), device=s_0.device)
             for k in range(self.s_marginal.size(-1)):
-                y_prior = self.y_cond_s_marginal[:, k].expand(sum(s_0==k), -1)
+                y_prior = self.y_cond_s_marginal[:, k].expand(sum(s_0 == k), -1)
                 y_0_k = y_prior.multinomial(1).reshape(-1)
-                y_0[s_0==k] = y_0_k.float()
+                y_0[s_0 == k] = y_0_k.float()
             y_0 = torch.LongTensor(y_0.cpu().numpy()).to(s_0.device)
         else:
             y_0 = None
@@ -960,10 +991,14 @@ class ModelSync(BaseModel):
         # (|V|, |V|)
         E_t = self.sample_E(E_prior)
 
-        # (F, |V|, 2)
-        X_prior = self.X_marginal[:, None, :].expand(-1, self.num_nodes, -1) # You should change this for different initializations of X
-        # (|V|, 2F)
-        X_t_one_hot = self.sample_X(X_prior)
+        if fixed_X_one_hot_3d is not None:
+            X_t_one_hot = fixed_X_one_hot_3d.transpose(0, 1)
+            X_t_one_hot = X_t_one_hot.reshape(self.num_nodes, -1)
+        else:
+            # (F, |V|, 2)
+            X_prior = self.X_marginal[:, None, :].expand(-1, self.num_nodes, -1) # You should change this for different initializations of X
+            # (|V|, 2F)
+            X_t_one_hot = self.sample_X(X_prior)
 
         # Iteratively sample p(D^s | D^t) for t = 1, ..., T, with s = t - 1.
         for s in tqdm(list(reversed(range(0, self.T)))):
@@ -980,12 +1015,17 @@ class ModelSync(BaseModel):
             Q_bar_t_E = self.transition_A.get_Q_bar_E(alpha_bar_t)
 
             t_float = torch.tensor([t / self.T]).to(device)
+            X_input_one_hot = X_t_one_hot
+            if fixed_X_one_hot_3d is not None and is_diff_X:
+                Q_bar_t_X = self.transition_X.get_Q_bar_X(alpha_bar_t)
+                prob_X = torch.bmm(fixed_X_one_hot_3d, Q_bar_t_X)
+                X_input_one_hot = self.sample_X(prob_X)
 
             A_t, E_s = self.get_E_t(device,
                                     data_loader,
                                     self.graph_encoder.pred_E,
                                     t_float,
-                                    X_t_one_hot,
+                                    X_input_one_hot,
                                     s_0,
                                     E_t,
                                     Q_t_E,
@@ -994,33 +1034,37 @@ class ModelSync(BaseModel):
                                     batch_size,
                                     y_0)
 
-            # (|V|, F, 2)
-            pred_X = self.graph_encoder.pred_X(t_float,
-                                               X_t_one_hot,
-                                               A_t,
-                                               s_0,
-                                               y_0)
-            pred_X = pred_X.softmax(dim=-1)
-            # (F, |V|, 2)
-            pred_X = torch.transpose(pred_X, 0, 1)
-            if is_diff_X:
+            if fixed_X_one_hot_3d is None:
                 # (|V|, F, 2)
-                X_t_one_hot = X_t_one_hot.reshape(self.num_nodes, self.num_attrs_X, -1)
+                pred_X = self.graph_encoder.pred_X(t_float,
+                                                   X_t_one_hot,
+                                                   A_t,
+                                                   s_0,
+                                                   y_0)
+                pred_X = pred_X.softmax(dim=-1)
                 # (F, |V|, 2)
-                X_t_one_hot = torch.transpose(X_t_one_hot, 0, 1)
+                pred_X = torch.transpose(pred_X, 0, 1)
+                if is_diff_X:
+                    # (|V|, F, 2)
+                    X_t_one_hot = X_t_one_hot.reshape(self.num_nodes, self.num_attrs_X, -1)
+                    # (F, |V|, 2)
+                    X_t_one_hot = torch.transpose(X_t_one_hot, 0, 1)
 
-                # (F, |V|, 2)
-                Q_t_X = self.transition_X.get_Q_bar_X(alpha_t)
-                Q_bar_s_X = self.transition_X.get_Q_bar_X(alpha_bar_s)
-                Q_bar_t_X = self.transition_X.get_Q_bar_X(alpha_bar_t)
+                    # (F, |V|, 2)
+                    Q_t_X = self.transition_X.get_Q_bar_X(alpha_t)
+                    Q_bar_s_X = self.transition_X.get_Q_bar_X(alpha_bar_s)
+                    Q_bar_t_X = self.transition_X.get_Q_bar_X(alpha_bar_t)
 
-                X_prob = self.posterior(X_t_one_hot, Q_t_X,
-                                        Q_bar_s_X, Q_bar_t_X, pred_X)
-                X_t_one_hot = self.sample_X(X_prob)
+                    X_prob = self.posterior(X_t_one_hot, Q_t_X,
+                                            Q_bar_s_X, Q_bar_t_X, pred_X)
+                    X_t_one_hot = self.sample_X(X_prob)
             E_t = E_s
-        X_t_one_hot = X_t_one_hot.reshape(self.num_nodes, self.num_attrs_X, -1)
-        # (F, |V|, 2)
-        X_t_one_hot = torch.transpose(X_t_one_hot, 0, 1)
+        if fixed_X_one_hot_3d is not None:
+            X_t_one_hot = fixed_X_one_hot_3d
+        else:
+            X_t_one_hot = X_t_one_hot.reshape(self.num_nodes, self.num_attrs_X, -1)
+            # (F, |V|, 2)
+            X_t_one_hot = torch.transpose(X_t_one_hot, 0, 1)
         s_0_one_hot = F.one_hot(s_0, num_classes=self.num_classes_s).float()
         if y_0 is not None:
             y_0_one_hot = F.one_hot(y_0, num_classes=self.num_classes_y).float()

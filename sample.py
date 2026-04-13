@@ -241,7 +241,12 @@ def main(args):
         Path(args.save_pt_path).parent.mkdir(parents=True, exist_ok=True)
 
     for sample_idx in range(args.num_samples):
-        X_0_one_hot, s_0_one_hot, y_0_one_hot, E_0, node_orig_id = model.sample(is_diff_X=True)
+        X_0_one_hot, s_0_one_hot, y_0_one_hot, E_0, node_orig_id = model.sample(
+            is_diff_X=True,
+            fixed_X_one_hot_3d=X_one_hot_3d_real,
+            fixed_s=s_real,
+            fixed_y=y_real,
+        )
 
         # 기존 evaluator용 DGL graph
         src_all, dst_all = E_0.nonzero().T
