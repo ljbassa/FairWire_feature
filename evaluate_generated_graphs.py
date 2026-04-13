@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
 """
 Evaluate saved generated graphs with:
-1) overlap/auc on fixed reference pairs (same as before)
-2) stronger GNN link prediction on the generated graph itself, then evaluate on the same fixed reference pairs.
+1) overlap/auc on fixed reference pairs
+2) link prediction that mirrors FairWire sample.py's GAE evaluator structure.
 
-This version keeps the same graph_path + dataset interface, but upgrades the LP model/training to a
-more standard GAE-style protocol:
-- build train/val splits from each generated graph
-- train on TRAIN adjacency only
-- use validation AUC + early stopping
-- optionally search over a small hyperparameter grid
-- evaluate the trained model on fixed reference pairs for AUC/SP/score-SP/EO
+The LP path follows eval_utils.prepare_for_GAE + Model.discriminator.GAETrainer:
+- use a symmetrically normalized adjacency with self-loops
+- split positive upper-triangle edges 80/10/10 into train/val/test
+- sample validation/test negatives from true non-edges
+- train a 1-layer GAE with the same hyperparameter grid and validation-AUC early stopping
+- report AUC/SP/EO on generated-graph held-out test pairs
 
-Outputs are CSV-only.
+This file is self-contained so EDGE_fairness, EDGE_fairness_loss, FairWire, and
+FairWire_feature use the same measurement structure without importing sample.py.
 """
 
 import argparse
@@ -21,7 +21,7 @@ import itertools
 import math
 import pickle
 import random
-from dataclasses import dataclass
+from copy import deepcopy
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -31,9 +31,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from sklearn.metrics import roc_auc_score
-from torch_geometric.data import Data
-from torch_geometric.nn import GATConv, GCNConv, SAGEConv
-from torch_geometric.utils import degree, negative_sampling, remove_self_loops, to_undirected
 
 
 # -----------------------------
@@ -78,158 +75,152 @@ def safe_group_mean(values: np.ndarray, mask: np.ndarray) -> float:
     return float(values[mask].mean())
 
 
+def safe_abs(value: float) -> float:
+    if not np.isfinite(value):
+        return float("nan")
+    return float(abs(value))
+
+
 def safe_diff(a: float, b: float) -> float:
     if not np.isfinite(a) or not np.isfinite(b):
         return float("nan")
     return float(a - b)
 
 
-def safe_abs(a: float) -> float:
-    if not np.isfinite(a):
-        return float("nan")
-    return float(abs(a))
-
-
-def unique_undirected_edge_index(edge_index: torch.Tensor) -> torch.Tensor:
-    edge_index, _ = remove_self_loops(edge_index)
-    row, col = edge_index
-    mask = row < col
-    return torch.stack([row[mask], col[mask]], dim=0)
-
-
-def ensure_features(data: Data) -> Data:
-    if getattr(data, "x", None) is None or data.x is None:
-        deg = degree(data.edge_index[0], num_nodes=data.num_nodes, dtype=torch.float).view(-1, 1)
-        data.x = deg
-    else:
-        data.x = data.x.float()
-    return data
-
-
-def global_id_mapping(data: Data) -> Tuple[List[int], Dict[int, int]]:
-    if hasattr(data, "orig_id") and data.orig_id is not None:
-        gids = [int(v) for v in data.orig_id.cpu().numpy().tolist()]
-    else:
-        gids = list(range(data.num_nodes))
-    g2l = {g: i for i, g in enumerate(gids)}
-    return gids, g2l
-
-
-def write_csv(rows: List[Dict], path: Path) -> None:
+def write_csv(rows: List[Dict[str, Any]], path: Path) -> None:
     if not rows:
         return
     path.parent.mkdir(parents=True, exist_ok=True)
     keys: List[str] = []
     seen = set()
     for row in rows:
-        for k in row.keys():
-            if k not in seen:
-                seen.add(k)
-                keys.append(k)
-    with path.open("w", newline="", encoding="utf-8") as f:
+        for key in row.keys():
+            if key not in seen:
+                seen.add(key)
+                keys.append(key)
+    with path.open("w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=keys)
         writer.writeheader()
         writer.writerows(rows)
 
 
-def add_compat_metric_aliases(row: Dict[str, float]) -> None:
-    """
-    Add EDGE-style compatibility aliases so FairWire outputs can be compared
-    against the EDGE fairness grid CSVs with minimal post-processing.
-    """
+def add_compat_metric_aliases(row: Dict[str, Any]) -> None:
     alias_pairs = [
-        ("overlap/auc", "value/linkpred_auc"),
-        ("lp/score_sp_gap", "fair_gap"),
-        ("lp/score_sp_abs_gap", "fair_abs_gap"),
-        ("lp/score_sp_gap", "value/fair_gap"),
-        ("lp/score_sp_abs_gap", "value/fair_abs_gap"),
+        ("lp/auc", "value/linkpred_auc"),
+        ("lp/sp_gap", "fair_gap"),
+        ("lp/sp_abs_gap", "fair_abs_gap"),
+        ("lp/sp_gap", "value/fair_gap"),
+        ("lp/sp_abs_gap", "value/fair_abs_gap"),
     ]
     for src, dst in alias_pairs:
         if src in row and dst not in row:
-            row[dst] = float(row[src])
+            row[dst] = row[src]
+
+
+def unique_undirected_edge_index(edge_index: torch.Tensor) -> torch.Tensor:
+    edge_index = edge_index.detach().cpu().long()
+    row, col = edge_index
+    mask = row != col
+    row = row[mask]
+    col = col[mask]
+    lo = torch.minimum(row, col)
+    hi = torch.maximum(row, col)
+    edges = torch.stack([lo, hi], dim=0)
+    if edges.numel() == 0:
+        return edges.reshape(2, 0)
+    edges = torch.unique(edges.t(), dim=0).t().contiguous()
+    order = torch.argsort(edges[0] * int(edge_index.max().item() + 1 if edge_index.numel() else 1) + edges[1])
+    return edges[:, order]
+
+
+def ensure_features(data) -> Any:
+    if getattr(data, "x", None) is None or data.x is None:
+        edge_index = data.edge_index.detach().cpu().long()
+        deg = torch.bincount(edge_index[0], minlength=int(data.num_nodes)).float().view(-1, 1)
+        data.x = deg
+    else:
+        data.x = data.x.float()
+        if data.x.dim() == 1:
+            data.x = data.x.view(-1, 1)
+    return data
+
+
+def get_local_attr_vector(data, attr: str) -> torch.Tensor:
+    if not hasattr(data, attr):
+        raise ValueError(f"data has no attribute {attr!r}")
+    values = getattr(data, attr)
+    if values is None:
+        raise ValueError(f"data.{attr} is None")
+    if values.dim() > 1:
+        values = values.squeeze()
+    return values.detach().cpu()
+
+
+def get_lp_group_vector(data, preferred_attr: str = "y") -> torch.Tensor:
+    # sample.py's link-prediction branch uses s as the pair-group label.
+    # Saved FairWire graphs carry this as `sens`; EDGE graphs usually carry `y`.
+    if hasattr(data, "sens") and getattr(data, "sens") is not None:
+        return get_local_attr_vector(data, "sens").long()
+    if hasattr(data, preferred_attr) and getattr(data, preferred_attr) is not None:
+        return get_local_attr_vector(data, preferred_attr).long()
+    if hasattr(data, "y") and getattr(data, "y") is not None:
+        return get_local_attr_vector(data, "y").long()
+    raise ValueError("No node group attribute found; expected sens or y.")
+
+
+def global_id_mapping(data) -> Tuple[List[int], Dict[int, int]]:
+    if hasattr(data, "orig_id") and data.orig_id is not None:
+        gids = [int(v) for v in data.orig_id.detach().cpu().numpy().tolist()]
+    else:
+        gids = list(range(int(data.num_nodes)))
+    return gids, {g: i for i, g in enumerate(gids)}
 
 
 # -----------------------------
-# Graph loading
+# Graph loading / reference pairs
 # -----------------------------
 
-def load_saved_graphs(graph_path: str) -> List[Data]:
-    obj = torch.load(graph_path, map_location="cpu")
+def load_saved_graphs(graph_path: str) -> List[Any]:
+    obj = torch.load(graph_path, map_location="cpu", weights_only=False)
     graphs = obj if isinstance(obj, list) else [obj]
     if not graphs:
         raise ValueError(f"No graphs found in {graph_path}")
     return graphs
 
 
-def get_local_sensitive_vector(data: Data, sensitive_attr: str, sensitive_value: Optional[int]) -> torch.Tensor:
-    if not hasattr(data, sensitive_attr):
-        raise ValueError(f"data has no attribute {sensitive_attr!r}")
-    s = getattr(data, sensitive_attr)
-    if s is None:
-        raise ValueError(f"data.{sensitive_attr} is None")
-    if s.dim() > 1:
-        s = s.squeeze()
-    # Legacy naming is kept for CSV/CLI compatibility. Fairness groups are now
-    # defined by same-label vs different-label pairs over this node attribute.
-    _ = sensitive_value
-    return s.detach().cpu()
-
-
-def pair_sensitive_mask_from_local_pairs(
-    pairs: Sequence[Tuple[int, int]],
-    local_sensitive: torch.Tensor,
-    mode: str = "either",
-) -> np.ndarray:
-    _ = mode
-    mask = []
-    for u, v in pairs:
-        su = local_sensitive[int(u)].item()
-        sv = local_sensitive[int(v)].item()
-        mask.append(su == sv)
-    return np.asarray(mask, dtype=bool)
-
-
-# -----------------------------
-# Reference graph / fixed pairs
-# -----------------------------
-
 def _candidate_reference_paths(graph_path: Path, dataset: str) -> List[Path]:
     candidates: List[Path] = []
     names = [f"{dataset}_feat.pkl", f"{dataset}.pkl"]
 
-    def add_candidates_from_root(root: Path) -> None:
+    def add(root: Path) -> None:
         for name in names:
             candidates.append(root / "graphs" / name)
             candidates.append(root / name)
 
     gp = graph_path.resolve()
     for root in [gp.parent, *gp.parent.parents]:
-        add_candidates_from_root(root)
-
+        add(root)
     cwd = Path.cwd().resolve()
     for root in [cwd, *cwd.parents]:
-        add_candidates_from_root(root)
+        add(root)
 
-    dedup: List[Path] = []
+    out: List[Path] = []
     seen = set()
     for c in candidates:
         if str(c) not in seen:
             seen.add(str(c))
-            dedup.append(c)
-    return dedup
+            out.append(c)
+    return out
 
 
 def find_reference_graph_path(graph_path: str, dataset: str) -> Path:
-    gp = Path(graph_path)
-    candidates = _candidate_reference_paths(gp, dataset)
-    for c in candidates:
+    for c in _candidate_reference_paths(Path(graph_path), dataset):
         if c.exists():
             return c
-    searched = "\n".join(str(c) for c in candidates)
+    searched = "\n".join(str(c) for c in _candidate_reference_paths(Path(graph_path), dataset))
     raise FileNotFoundError(
         f"Could not find reference graph for dataset={dataset!r}.\n"
-        f"Searched these candidate paths:\n{searched}\n"
-        f"Expected something like graphs/{dataset}_feat.pkl near graph_path or current working directory."
+        f"Searched these candidate paths:\n{searched}"
     )
 
 
@@ -242,20 +233,26 @@ def load_reference_graph_from_dataset(graph_path: str, dataset: str) -> nx.Graph
     return g_ref
 
 
-def build_reference_node_sensitive_map(g_ref: nx.Graph, sensitive_attr: str, sensitive_value: Optional[int]) -> Dict[int, Any]:
+def build_reference_node_group_map(g_ref: nx.Graph, attr: str) -> Dict[int, Any]:
     out: Dict[int, Any] = {}
+    fallback = "sens" if attr == "y" else "y"
     for n, attrs in g_ref.nodes(data=True):
-        if sensitive_attr not in attrs:
-            raise KeyError(f"Reference graph node {n} lacks attr {sensitive_attr!r}")
-        val = attrs[sensitive_attr]
+        key = attr if attr in attrs else fallback if fallback in attrs else None
+        if key is None:
+            raise KeyError(f"Reference graph node {n} lacks attr {attr!r} or fallback {fallback!r}")
+        val = attrs[key]
         if hasattr(val, "item"):
             val = val.item()
-        _ = sensitive_value
         out[int(n)] = val
     return out
 
 
-def build_fixed_eval_pairs(g_ref: nx.Graph, max_pos_edges: int = 20000, neg_ratio: float = 1.0, seed: int = 0) -> Tuple[List[Tuple[int, int]], np.ndarray]:
+def build_fixed_eval_pairs(
+    g_ref: nx.Graph,
+    max_pos_edges: int = 20000,
+    neg_ratio: float = 1.0,
+    seed: int = 0,
+) -> Tuple[List[Tuple[int, int]], np.ndarray]:
     rng = random.Random(seed)
     nodes = [int(n) for n in g_ref.nodes()]
 
@@ -265,16 +262,11 @@ def build_fixed_eval_pairs(g_ref: nx.Graph, max_pos_edges: int = 20000, neg_rati
         if u == v:
             continue
         e = (int(u), int(v)) if int(u) < int(v) else (int(v), int(u))
-        if e in edge_set:
-            continue
-        edge_set.add(e)
-        pos_edges_all.append(e)
+        if e not in edge_set:
+            edge_set.add(e)
+            pos_edges_all.append(e)
 
-    if max_pos_edges and len(pos_edges_all) > max_pos_edges:
-        pos_edges = rng.sample(pos_edges_all, max_pos_edges)
-    else:
-        pos_edges = pos_edges_all
-
+    pos_edges = rng.sample(pos_edges_all, max_pos_edges) if max_pos_edges and len(pos_edges_all) > max_pos_edges else pos_edges_all
     num_neg = int(len(pos_edges) * neg_ratio)
     neg_edges: List[Tuple[int, int]] = []
     neg_set = set()
@@ -297,35 +289,23 @@ def build_fixed_eval_pairs(g_ref: nx.Graph, max_pos_edges: int = 20000, neg_rati
     return pairs, labels
 
 
-def pair_sensitive_mask(pairs: Sequence[Tuple[int, int]], node_sensitive: Dict[int, Any], mode: str = "either") -> np.ndarray:
-    _ = mode
-    mask = []
-    for u, v in pairs:
-        su = node_sensitive[int(u)]
-        sv = node_sensitive[int(v)]
-        mask.append(su == sv)
-    return np.asarray(mask, dtype=bool)
+def pair_same_group_mask(pairs: Sequence[Tuple[int, int]], node_groups: Dict[int, Any]) -> np.ndarray:
+    return np.asarray([node_groups[int(u)] == node_groups[int(v)] for u, v in pairs], dtype=bool)
 
-
-# -----------------------------
-# Overlap AUC on fixed pairs
-# -----------------------------
 
 def edge_overlap_on_fixed_pairs(
-    data: Data,
+    data,
     reference_pairs: Sequence[Tuple[int, int]],
     reference_labels: np.ndarray,
-    reference_node_sensitive: Dict[int, Any],
-    edge_sensitive_mode: str,
+    reference_node_groups: Dict[int, Any],
 ) -> Tuple[Dict[str, float], Dict[str, np.ndarray]]:
     _gids, g2l = global_id_mapping(data)
-    edge_index = unique_undirected_edge_index(data.edge_index.cpu())
-    edge_set = {tuple(sorted((int(u), int(v)))) for u, v in edge_index.t().tolist()}
+    edge_index = unique_undirected_edge_index(data.edge_index)
+    edge_set = {tuple(map(int, e)) for e in edge_index.t().tolist()}
 
     keep_idx: List[int] = []
     scores: List[float] = []
     kept_pairs: List[Tuple[int, int]] = []
-
     for i, (u, v) in enumerate(reference_pairs):
         if u in g2l and v in g2l and u != v:
             keep_idx.append(i)
@@ -339,8 +319,7 @@ def edge_overlap_on_fixed_pairs(
     keep_idx_arr = np.asarray(keep_idx, dtype=np.int64)
     labels = reference_labels[keep_idx_arr]
     scores_arr = np.asarray(scores, dtype=np.float32)
-    sens_mask = pair_sensitive_mask(kept_pairs, reference_node_sensitive, mode=edge_sensitive_mode)
-
+    sens_mask = pair_same_group_mask(kept_pairs, reference_node_groups)
     metrics = {
         "overlap/auc": safe_auc(labels, scores_arr),
         "overlap/num_eval_pairs": float(len(keep_idx)),
@@ -356,645 +335,367 @@ def edge_overlap_on_fixed_pairs(
 
 
 # -----------------------------
-# GAE-style LP model
+# sample.py-compatible GAE LP
 # -----------------------------
 
-class BaseEncoder(nn.Module):
-    def encode(self, x, edge_index):
-        raise NotImplementedError
-
-
-class StackedGCNEncoder(BaseEncoder):
-    def __init__(self, in_dim: int, hidden_dim: int, out_dim: int, dropout: float, num_layers: int = 2):
+class SamplePyGCN(nn.Module):
+    def __init__(self, in_size: int, out_size: int, num_layers: int, hidden_size: int, dropout: float):
         super().__init__()
-        assert num_layers >= 1
-        self.layers = nn.ModuleList()
-        if num_layers == 1:
-            self.layers.append(GCNConv(in_dim, out_dim))
-        else:
-            self.layers.append(GCNConv(in_dim, hidden_dim))
+        self.lins = nn.ModuleList()
+        if num_layers >= 2:
+            self.lins.append(nn.Linear(in_size, hidden_size))
             for _ in range(num_layers - 2):
-                self.layers.append(GCNConv(hidden_dim, hidden_dim))
-            self.layers.append(GCNConv(hidden_dim, out_dim))
+                self.lins.append(nn.Linear(hidden_size, hidden_size))
+            self.lins.append(nn.Linear(hidden_size, out_size))
+        else:
+            self.lins.append(nn.Linear(in_size, out_size))
         self.dropout = dropout
 
-    def encode(self, x, edge_index):
-        h = x
-        for i, conv in enumerate(self.layers):
-            h = conv(h, edge_index)
-            if i != len(self.layers) - 1:
-                h = F.relu(h)
-                h = F.dropout(h, p=self.dropout, training=self.training)
-        return h
+    def forward(self, A: torch.Tensor, H: torch.Tensor) -> torch.Tensor:
+        for lin in self.lins[:-1]:
+            H = A @ lin(H)
+            H = F.relu(H)
+            H = F.dropout(H, p=self.dropout, training=self.training)
+        return A @ self.lins[-1](H)
 
 
-class StackedSAGEEncoder(BaseEncoder):
-    def __init__(self, in_dim: int, hidden_dim: int, out_dim: int, dropout: float, num_layers: int = 2):
+class SamplePyGAE(nn.Module):
+    def __init__(self, in_size: int, num_layers: int, hidden_size: int, dropout: float):
         super().__init__()
-        assert num_layers >= 1
-        self.layers = nn.ModuleList()
-        if num_layers == 1:
-            self.layers.append(SAGEConv(in_dim, out_dim))
-        else:
-            self.layers.append(SAGEConv(in_dim, hidden_dim))
-            for _ in range(num_layers - 2):
-                self.layers.append(SAGEConv(hidden_dim, hidden_dim))
-            self.layers.append(SAGEConv(hidden_dim, out_dim))
-        self.dropout = dropout
+        self.gcn = SamplePyGCN(in_size, hidden_size, num_layers, hidden_size, dropout)
 
-    def encode(self, x, edge_index):
-        h = x
-        for i, conv in enumerate(self.layers):
-            h = conv(h, edge_index)
-            if i != len(self.layers) - 1:
-                h = F.relu(h)
-                h = F.dropout(h, p=self.dropout, training=self.training)
-        return h
+    def forward(self, A: torch.Tensor, Z: torch.Tensor) -> torch.Tensor:
+        return self.gcn(A, Z)
 
 
-class StackedGATEncoder(BaseEncoder):
-    def __init__(self, in_dim: int, hidden_dim: int, out_dim: int, dropout: float, num_layers: int = 2, heads: int = 4):
-        super().__init__()
-        assert num_layers >= 1
-        self.layers = nn.ModuleList()
-        if num_layers == 1:
-            self.layers.append(GATConv(in_dim, out_dim, heads=1, concat=False, dropout=dropout))
-        else:
-            self.layers.append(GATConv(in_dim, hidden_dim, heads=heads, concat=True, dropout=dropout))
-            hidden_in = hidden_dim * heads
-            for _ in range(num_layers - 2):
-                self.layers.append(GATConv(hidden_in, hidden_dim, heads=heads, concat=True, dropout=dropout))
-                hidden_in = hidden_dim * heads
-            self.layers.append(GATConv(hidden_in, out_dim, heads=1, concat=False, dropout=dropout))
-        self.dropout = dropout
-
-    def encode(self, x, edge_index):
-        h = x
-        for i, conv in enumerate(self.layers):
-            h = conv(h, edge_index)
-            if i != len(self.layers) - 1:
-                h = F.elu(h)
-                h = F.dropout(h, p=self.dropout, training=self.training)
-        return h
+def samplepy_device() -> torch.device:
+    return torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 
-class DotProductGAE(nn.Module):
-    def __init__(self, encoder: BaseEncoder):
-        super().__init__()
-        self.encoder = encoder
-
-    def encode(self, x, edge_index):
-        return self.encoder.encode(x, edge_index)
-
-    @staticmethod
-    def decode(z, edge_index):
-        src, dst = edge_index
-        return (z[src] * z[dst]).sum(dim=-1)
-
-
-@dataclass
-class LPTrialConfig:
-    backbone: str
-    num_layers: int
-    hidden_dim: int
-    out_dim: int
-    dropout: float
-    lr: float
-    weight_decay: float
-    epochs: int
-    patience: int
-    batch_size: int
-    device: str
-    gat_heads: int
+def samplepy_normalize_adjacency(num_nodes: int, undirected_edges: torch.Tensor) -> torch.Tensor:
+    A = torch.zeros((num_nodes, num_nodes), dtype=torch.float32)
+    if undirected_edges.numel() > 0:
+        row, col = undirected_edges.long().cpu()
+        A[row, col] = 1.0
+        A[col, row] = 1.0
+    A_hat = A + torch.eye(num_nodes, dtype=torch.float32)
+    deg = A_hat.sum(dim=1)
+    deg_inv_sqrt = deg.pow(-0.5)
+    deg_inv_sqrt[~torch.isfinite(deg_inv_sqrt)] = 0.0
+    return deg_inv_sqrt.view(-1, 1) * A_hat * deg_inv_sqrt.view(1, -1)
 
 
-def build_encoder(in_dim: int, cfg: LPTrialConfig) -> BaseEncoder:
-    if cfg.backbone == "gcn":
-        return StackedGCNEncoder(in_dim, cfg.hidden_dim, cfg.out_dim, cfg.dropout, num_layers=cfg.num_layers)
-    if cfg.backbone == "sage":
-        return StackedSAGEEncoder(in_dim, cfg.hidden_dim, cfg.out_dim, cfg.dropout, num_layers=cfg.num_layers)
-    if cfg.backbone == "gat":
-        return StackedGATEncoder(in_dim, cfg.hidden_dim, cfg.out_dim, cfg.dropout, num_layers=cfg.num_layers, heads=cfg.gat_heads)
-    raise ValueError(f"Unknown backbone: {cfg.backbone}")
+def samplepy_get_edge_split(A_dense: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    A_dense_upper = torch.triu(A_dense, diagonal=1)
+    real_edges = A_dense_upper.nonzero()
+    if real_edges.size(0) < 3:
+        raise ValueError("Not enough positive edges for sample.py 80/10/10 GAE split.")
+
+    real_edges = real_edges[torch.randperm(real_edges.size(0))]
+    num_real = len(real_edges)
+    num_train = int(num_real * 0.8)
+    num_val = int(num_real * 0.1)
+    num_test = num_real - num_train - num_val
+    if num_val <= 0 or num_test <= 0:
+        raise ValueError("Not enough positive edges to create non-empty val/test splits.")
+
+    real_train, real_val, real_test = torch.split(real_edges, [num_train, num_val, num_test])
+
+    neg_edges = torch.triu((A_dense == 0).float(), diagonal=1).nonzero()
+    if neg_edges.size(0) < num_val + num_test:
+        raise ValueError("Not enough negative edges for sample.py GAE val/test split.")
+    neg_edges = neg_edges[torch.randperm(neg_edges.size(0))]
+    neg_val = neg_edges[:num_val]
+    neg_test = neg_edges[num_val:num_val + num_test]
+    return real_train, real_val, real_test, neg_val, neg_test
 
 
-def build_model(in_dim: int, cfg: LPTrialConfig) -> DotProductGAE:
-    return DotProductGAE(build_encoder(in_dim, cfg))
-
-
-# -----------------------------
-# Generated-graph splits (GAE-style)
-# -----------------------------
-
-def split_positive_edges(pos_edge_index: torch.Tensor, holdout_ratio: float, seed: int) -> Tuple[torch.Tensor, torch.Tensor]:
-    num_pos = pos_edge_index.size(1)
-    if num_pos < 3:
-        raise ValueError("Not enough positive edges to create a split.")
-
-    g = torch.Generator().manual_seed(seed)
-    perm = torch.randperm(num_pos, generator=g)
-
-    num_holdout = max(1, int(math.ceil(num_pos * holdout_ratio)))
-    num_holdout = min(num_holdout, num_pos - 1)
-
-    holdout_pos = pos_edge_index[:, perm[:num_holdout]]
-    remain_pos = pos_edge_index[:, perm[num_holdout:]]
-    return remain_pos, holdout_pos
-
-def sample_true_negative_edges(num_nodes: int, pos_edge_index: torch.Tensor, num_samples: int, seed: int = 0) -> torch.Tensor:
-    rng = random.Random(seed)
-    pos_set = {tuple(sorted((int(u), int(v)))) for u, v in pos_edge_index.t().tolist()}
-    neg_set = set()
-
-    max_possible = num_nodes * (num_nodes - 1) // 2 - len(pos_set)
-    if num_samples > max_possible:
-        raise ValueError(f"Requested {num_samples} negatives, but only {max_possible} true non-edges exist.")
-
-    while len(neg_set) < num_samples:
-        u = rng.randrange(num_nodes)
-        v = rng.randrange(num_nodes)
-        if u == v:
-            continue
-        e = (u, v) if u < v else (v, u)
-        if e in pos_set or e in neg_set:
-            continue
-        neg_set.add(e)
-    return torch.tensor(sorted(list(neg_set)), dtype=torch.long).t().contiguous()
-
-
-def build_generated_graph_train_test_split(
-    data: Data,
-    test_ratio: float = 0.2,
-    seed: int = 0,
-) -> Dict[str, torch.Tensor]:
+def samplepy_prepare_for_gae(data) -> Dict[str, torch.Tensor]:
     data = ensure_features(data)
-    full_pos = unique_undirected_edge_index(data.edge_index.cpu())
-    train_pos, test_pos = split_positive_edges(full_pos, holdout_ratio=test_ratio, seed=seed)
-    test_neg = sample_true_negative_edges(
-        num_nodes=data.num_nodes,
-        pos_edge_index=full_pos,
-        num_samples=test_pos.size(1),
-        seed=seed + 1,
-    )
+    num_nodes = int(data.num_nodes)
+    full_edges = unique_undirected_edge_index(data.edge_index)
+    A_full = samplepy_normalize_adjacency(num_nodes, full_edges)
+    A_dense = A_full.clone()
+
+    real_train, real_val, real_test, neg_val, neg_test = samplepy_get_edge_split(A_dense)
+
+    train_mask = torch.zeros(num_nodes, num_nodes, dtype=torch.bool)
+    val_mask = torch.zeros(num_nodes, num_nodes, dtype=torch.bool)
+    test_mask = torch.zeros(num_nodes, num_nodes, dtype=torch.bool)
+
+    row_train, col_train = real_train.T
+    train_mask[row_train, col_train] = True
+
+    edge_val = torch.cat([real_val, neg_val], dim=0)
+    row_val, col_val = edge_val.T
+    val_mask[row_val, col_val] = True
+
+    edge_test = torch.cat([real_test, neg_test], dim=0)
+    row_test, col_test = edge_test.T
+    test_mask[row_test, col_test] = True
+
+    A_train = samplepy_normalize_adjacency(num_nodes, real_train.t().contiguous())
     return {
-        "full_pos": full_pos,
-        "train_pos": train_pos,
-        "test_pos": test_pos,
-        "test_neg": test_neg,
-        "train_mp_edge_index": to_undirected(train_pos),
-        "full_mp_edge_index": to_undirected(full_pos),
+        "A_full": A_full,
+        "A_train": A_train,
+        "train_mask": train_mask,
+        "val_mask": val_mask,
+        "test_mask": test_mask,
+        "num_train_pos": torch.tensor(float(real_train.size(0))),
+        "num_val_pos": torch.tensor(float(real_val.size(0))),
+        "num_test_pos": torch.tensor(float(real_test.size(0))),
+        "num_test_neg": torch.tensor(float(neg_test.size(0))),
     }
 
 
-def build_generated_graph_val_split(
-    data: Data,
-    val_ratio: float = 0.1,
-    seed: int = 0,
-) -> Dict[str, torch.Tensor]:
-    data = ensure_features(data)
-    full_pos = unique_undirected_edge_index(data.edge_index.cpu())
-    num_pos = full_pos.size(1)
-    if num_pos < 3:
-        raise ValueError("Not enough positive edges to create train/val split.")
-
-    g = torch.Generator().manual_seed(seed)
-    perm = torch.randperm(num_pos, generator=g)
-
-    num_val = max(1, int(math.ceil(num_pos * val_ratio)))
-    num_val = min(num_val, num_pos - 1)
-
-    val_pos = full_pos[:, perm[:num_val]]
-    train_pos = full_pos[:, perm[num_val:]]
-
-    val_neg = sample_true_negative_edges(
-        num_nodes=data.num_nodes,
-        pos_edge_index=full_pos,
-        num_samples=val_pos.size(1),
-        seed=seed + 1,
-    )
-    train_mp_edge_index = to_undirected(train_pos)
-    full_mp_edge_index = to_undirected(full_pos)
-
-    return {
-        "full_pos": full_pos,
-        "train_pos": train_pos,
-        "val_pos": val_pos,
-        "val_neg": val_neg,
-        "train_mp_edge_index": train_mp_edge_index,
-        "full_mp_edge_index": full_mp_edge_index,
-    }
+def samplepy_preprocess(A_train: torch.Tensor, A_full: torch.Tensor, X: torch.Tensor, s: torch.Tensor, Y: Optional[torch.Tensor], num_classes: Optional[int]) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    device = samplepy_device()
+    A_train = A_train.to(device)
+    A_full = A_full.to(device)
+    X = X.to(device).float()
+    s_device = s.to(device)
+    _s_one_hot = F.one_hot(s_device.long(), len(torch.unique(s_device)))
+    if Y is not None:
+        if num_classes is None:
+            num_classes = int(Y.max().item()) + 1
+        Y_device = Y.to(device)
+        Y_one_hot = F.one_hot(Y_device.long(), num_classes)
+        Z = torch.cat([X, _s_one_hot, Y_one_hot], dim=1)
+    else:
+        Z = X
+    A_full_dense = A_full.clone()
+    A_full_dense[A_full_dense != 0] = 1.0
+    return A_train, Z, A_full_dense
 
 
-def build_inner_train_val_split(
-    train_pos: torch.Tensor,
-    full_pos: torch.Tensor,
-    num_nodes: int,
-    val_ratio: float = 0.2,
-    seed: int = 0,
-) -> Dict[str, torch.Tensor]:
-    inner_train_pos, val_pos = split_positive_edges(train_pos, holdout_ratio=val_ratio, seed=seed)
-    val_neg = sample_true_negative_edges(
-        num_nodes=num_nodes,
-        pos_edge_index=full_pos,
-        num_samples=val_pos.size(1),
-        seed=seed + 1,
-    )
-    return {
-        "full_pos": full_pos,
-        "train_pos": inner_train_pos,
-        "val_pos": val_pos,
-        "val_neg": val_neg,
-        "train_mp_edge_index": to_undirected(inner_train_pos),
-        "full_mp_edge_index": to_undirected(full_pos),
-    }
+def samplepy_group_fairness(labels: np.ndarray, preds: np.ndarray, pair_same_mask: np.ndarray) -> Tuple[float, float]:
+    labels = np.asarray(labels)
+    preds = np.asarray(preds)
+    idx_same = np.asarray(pair_same_mask, dtype=bool)
+    idx_diff = ~idx_same
+    idx_same_y1 = np.bitwise_and(idx_same, labels == 1)
+    idx_diff_y1 = np.bitwise_and(idx_diff, labels == 1)
+
+    parity = safe_abs(safe_diff(safe_group_mean(preds, idx_same), safe_group_mean(preds, idx_diff)))
+    equality = safe_abs(safe_diff(safe_group_mean(preds, idx_same_y1), safe_group_mean(preds, idx_diff_y1)))
+    return parity, equality
 
 
-def evaluate_pairs_auc(model: DotProductGAE, x: torch.Tensor, mp_edge_index: torch.Tensor, pos_edges: torch.Tensor, neg_edges: torch.Tensor) -> float:
+@torch.no_grad()
+def samplepy_predict(A_train: torch.Tensor, Z: torch.Tensor, group_labels: torch.Tensor, A_full_dense: torch.Tensor, mask: torch.Tensor, model: SamplePyGAE) -> Tuple[float, float, float, Dict[str, np.ndarray]]:
     model.eval()
-    with torch.no_grad():
-        z = model.encode(x, mp_edge_index)
-        pos_logits = model.decode(z, pos_edges)
-        neg_logits = model.decode(z, neg_edges)
-        probs = torch.sigmoid(torch.cat([pos_logits, neg_logits], dim=0)).cpu().numpy()
-        labels = np.concatenate([
-            np.ones(pos_edges.size(1), dtype=np.int64),
-            np.zeros(neg_edges.size(1), dtype=np.int64),
-        ])
-    return safe_auc(labels, probs)
+    device = samplepy_device()
+    mask = mask.to(device)
+    group_labels = group_labels.to(device)
+    Z_out = model(A_train, Z)
+    pair_same = (group_labels.unsqueeze(1) == group_labels.unsqueeze(0))[mask].cpu().numpy()
+    probs = torch.sigmoid(Z_out @ Z_out.T)[mask].cpu().numpy()
+    labels = A_full_dense[mask].cpu().numpy().astype(np.int64)
+    sp, eo = samplepy_group_fairness(labels, probs, pair_same)
+    raw = {
+        "labels": labels,
+        "scores": probs,
+        "sens_mask": pair_same.astype(bool),
+    }
+    return safe_auc(labels, probs), sp, eo, raw
 
 
-def sample_train_negatives(full_mp_edge_index: torch.Tensor, num_nodes: int, num_neg_samples: int) -> torch.Tensor:
-    return negative_sampling(
-        edge_index=full_mp_edge_index,
-        num_nodes=num_nodes,
-        num_neg_samples=num_neg_samples,
-        method="sparse",
-    )
+def samplepy_config_list() -> List[Dict[str, Any]]:
+    hyper_space = {
+        "lr": [3e-2, 1e-2, 3e-3, 1e-3],
+        "num_layers": [1],
+        "hidden_size": [16, 32, 128, 512],
+        "dropout": [0.0, 0.1, 0.2],
+    }
+    priority = ["dropout", "lr", "num_layers", "hidden_size"]
+    configs = []
+    for values in itertools.product(*(hyper_space[k] for k in priority)):
+        configs.append(dict(zip(priority, values)))
+    return configs
 
 
-def build_search_space(args) -> List[LPTrialConfig]:
-    hidden_dims = args.lp_search_hidden_dims if args.lp_search else [args.lp_hidden_dim]
-    lrs = args.lp_search_lrs if args.lp_search else [args.lp_lr]
-    dropouts = args.lp_search_dropouts if args.lp_search else [args.lp_dropout]
-    num_layers_list = args.lp_search_num_layers if args.lp_search else [args.lp_num_layers]
+def samplepy_fit_trial(
+    A_train: torch.Tensor,
+    Z: torch.Tensor,
+    group_labels: torch.Tensor,
+    A_full_dense: torch.Tensor,
+    train_mask: torch.Tensor,
+    val_mask: torch.Tensor,
+    *,
+    num_layers: int,
+    hidden_size: int,
+    dropout: float,
+    lr: float,
+) -> Tuple[float, float, float, SamplePyGAE, Dict[str, float]]:
+    device = samplepy_device()
+    model = SamplePyGAE(
+        in_size=Z.size(1),
+        num_layers=int(num_layers),
+        hidden_size=int(hidden_size),
+        dropout=float(dropout),
+    ).to(device)
+    loss_func = nn.BCEWithLogitsLoss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=float(lr))
 
-    trials: List[LPTrialConfig] = []
-    for num_layers, hidden_dim, lr, dropout in itertools.product(num_layers_list, hidden_dims, lrs, dropouts):
-        trials.append(LPTrialConfig(
-            backbone=args.lp_model,
-            num_layers=int(num_layers),
-            hidden_dim=int(hidden_dim),
-            out_dim=int(args.lp_out_dim),
-            dropout=float(dropout),
-            lr=float(lr),
-            weight_decay=float(args.lp_weight_decay),
-            epochs=int(args.lp_epochs),
-            patience=int(args.lp_patience),
-            batch_size=int(args.lp_batch_size),
-            device=args.device,
-            gat_heads=int(args.gat_heads),
-        ))
-    return trials
-
-
-def train_gae_with_validation(data: Data, split: Dict[str, torch.Tensor], cfg: LPTrialConfig, seed: int) -> Tuple[DotProductGAE, Dict[str, float]]:
-    device = torch.device(cfg.device if torch.cuda.is_available() else "cpu")
-    data = ensure_features(data)
-
-    x = data.x.to(device)
-    train_mp_edge_index = split["train_mp_edge_index"].to(device)
-    full_mp_edge_index = split["full_mp_edge_index"].to(device)
-    train_pos = split["train_pos"].to(device)
-    val_pos = split["val_pos"].to(device)
-    val_neg = split["val_neg"].to(device)
-
-    model = build_model(x.size(-1), cfg).to(device)
-    opt = torch.optim.Adam(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
-    criterion = nn.BCEWithLogitsLoss()
-
-    best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
-    best_val_auc = -1.0
+    best_auc = -1.0
+    best_sp = float("nan")
+    best_eo = float("nan")
     best_epoch = 0
+    best_state = deepcopy(model.state_dict())
     bad_epochs = 0
 
-    num_train_pos = train_pos.size(1)
-    batch_size = min(cfg.batch_size, num_train_pos)
-    g = torch.Generator(device=device).manual_seed(seed)
+    train_dst, train_src = train_mask.to(device).nonzero().T
+    train_size = len(train_dst)
+    if train_size == 0:
+        raise ValueError("Empty sample.py GAE train mask.")
+    batch_size = 16384
+    num_nodes = Z.size(0)
 
-    for epoch in range(1, cfg.epochs + 1):
+    for epoch in range(1, 1000 + 1):
         model.train()
-        opt.zero_grad()
+        Z_out = model(A_train, Z)
 
-        z = model.encode(x, train_mp_edge_index)
-
-        if batch_size < num_train_pos:
-            perm = torch.randperm(num_train_pos, generator=g, device=device)[:batch_size]
-            batch_pos = train_pos[:, perm]
+        if train_size <= batch_size:
+            batch_dst = train_dst
+            batch_src = train_src
         else:
-            batch_pos = train_pos
+            batch_ids = torch.randint(low=0, high=train_size, size=(batch_size,), device=device)
+            batch_dst = train_dst[batch_ids]
+            batch_src = train_src[batch_ids]
 
-        batch_neg = sample_train_negatives(full_mp_edge_index, data.num_nodes, batch_pos.size(1)).to(device)
+        pos_pred = (Z_out[batch_src] * Z_out[batch_dst]).sum(dim=-1)
+        real_batch_size = len(batch_dst)
+        neg_src = torch.randint(0, num_nodes, (real_batch_size,), device=device)
+        neg_dst = torch.randint(0, num_nodes, (real_batch_size,), device=device)
+        neg_pred = (Z_out[neg_src] * Z_out[neg_dst]).sum(dim=-1)
 
-        pos_logits = model.decode(z, batch_pos)
-        neg_logits = model.decode(z, batch_neg)
-        labels = torch.cat([torch.ones_like(pos_logits), torch.zeros_like(neg_logits)], dim=0)
-        logits = torch.cat([pos_logits, neg_logits], dim=0)
-        loss = criterion(logits, labels)
+        pred = torch.cat([pos_pred, neg_pred], dim=0)
+        label = torch.cat([
+            torch.ones(real_batch_size, device=device),
+            torch.zeros(real_batch_size, device=device),
+        ], dim=0)
+        loss = loss_func(pred, label)
+        optimizer.zero_grad()
         loss.backward()
-        opt.step()
+        optimizer.step()
 
-        val_auc = evaluate_pairs_auc(model, x, train_mp_edge_index, val_pos, val_neg)
-        if np.isfinite(val_auc) and val_auc > best_val_auc:
-            best_val_auc = float(val_auc)
-            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
-            best_epoch = epoch
+        auc, sp, eo, _raw = samplepy_predict(A_train, Z, group_labels, A_full_dense, val_mask, model)
+        if np.isfinite(auc) and auc > best_auc:
             bad_epochs = 0
+            best_auc = float(auc)
+            best_sp = float(sp)
+            best_eo = float(eo)
+            best_epoch = epoch
+            best_state = deepcopy(model.state_dict())
         else:
             bad_epochs += 1
-            if bad_epochs >= cfg.patience:
-                break
+        if bad_epochs == 5:
+            break
 
     model.load_state_dict(best_state)
     meta = {
-        "best_val_auc": float(best_val_auc) if np.isfinite(best_val_auc) else float("nan"),
+        "best_val_auc": float(best_auc) if best_auc >= 0 else float("nan"),
+        "best_val_sp": float(best_sp),
+        "best_val_eo": float(best_eo),
         "best_epoch": float(best_epoch),
-        "num_layers": float(cfg.num_layers),
-        "hidden_dim": float(cfg.hidden_dim),
-        "dropout": float(cfg.dropout),
-        "lr": float(cfg.lr),
+        "best_num_layers": float(num_layers),
+        "best_hidden_dim": float(hidden_size),
+        "best_dropout": float(dropout),
+        "best_lr": float(lr),
     }
-    return model, meta
+    return best_auc, best_sp, best_eo, model, meta
 
 
-def choose_best_lp_model(data: Data, split: Dict[str, torch.Tensor], args, seed: int) -> Tuple[DotProductGAE, Dict[str, float]]:
-    search_space = build_search_space(args)
-    best_model = None
+def samplepy_train_and_eval(data, group_attr: str) -> Tuple[Dict[str, float], Dict[str, np.ndarray], Dict[str, float]]:
+    data = ensure_features(data)
+    split = samplepy_prepare_for_gae(data)
+    X = data.x.detach().cpu().float()
+    group_labels = get_lp_group_vector(data, preferred_attr=group_attr).long()
+    Y = None
+    num_classes = None
+
+    A_train, Z, A_full_dense = samplepy_preprocess(
+        split["A_train"],
+        split["A_full"],
+        X,
+        group_labels,
+        Y,
+        num_classes,
+    )
+
+    best_auc = -1.0
+    best_model: Optional[SamplePyGAE] = None
     best_meta: Dict[str, float] = {}
-    best_val_auc = -1.0
-
-    for i, cfg in enumerate(search_space):
-        trial_seed = seed + 1000 * i
-        model, meta = train_gae_with_validation(data, split, cfg, seed=trial_seed)
-        val_auc = meta.get("best_val_auc", float("nan"))
-        if np.isfinite(val_auc) and val_auc > best_val_auc:
-            best_val_auc = float(val_auc)
-            best_model = model
-            best_meta = {
-                "lp_protocol": "gae_val",
-                "lp_model": cfg.backbone,
-                **meta,
-            }
+    for config in samplepy_config_list():
+        trial_auc, _trial_sp, _trial_eo, trial_model, trial_meta = samplepy_fit_trial(
+            A_train,
+            Z,
+            group_labels,
+            A_full_dense,
+            split["train_mask"],
+            split["val_mask"],
+            **config,
+        )
+        if np.isfinite(trial_auc) and trial_auc > best_auc:
+            best_auc = float(trial_auc)
+            best_model = trial_model
+            best_meta = trial_meta
+        if trial_auc == 1.0:
+            break
 
     if best_model is None:
-        raise RuntimeError("Failed to train any LP model with finite validation AUC.")
-    return best_model, best_meta
+        raise RuntimeError("Failed to train sample.py-compatible GAE with finite validation AUC.")
 
+    test_auc, test_sp, test_eo, raw = samplepy_predict(
+        A_train,
+        Z,
+        group_labels,
+        A_full_dense,
+        split["test_mask"],
+        best_model,
+    )
 
-def train_gae_on_train_split(data: Data, split: Dict[str, torch.Tensor], cfg: LPTrialConfig, seed: int) -> Tuple[DotProductGAE, Dict[str, float]]:
-    device = torch.device(cfg.device if torch.cuda.is_available() else "cpu")
-    data = ensure_features(data)
-
-    x = data.x.to(device)
-    train_mp_edge_index = split["train_mp_edge_index"].to(device)
-    full_mp_edge_index = split["full_mp_edge_index"].to(device)
-    train_pos = split["train_pos"].to(device)
-
-    model = build_model(x.size(-1), cfg).to(device)
-    opt = torch.optim.Adam(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
-    criterion = nn.BCEWithLogitsLoss()
-
-    best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
-    best_train_loss = float("inf")
-    best_epoch = 0
-    bad_epochs = 0
-
-    num_train_pos = train_pos.size(1)
-    batch_size = min(cfg.batch_size, num_train_pos)
-    g = torch.Generator(device=device).manual_seed(seed)
-
-    for epoch in range(1, cfg.epochs + 1):
-        model.train()
-        opt.zero_grad()
-
-        z = model.encode(x, train_mp_edge_index)
-
-        if batch_size < num_train_pos:
-            perm = torch.randperm(num_train_pos, generator=g, device=device)[:batch_size]
-            batch_pos = train_pos[:, perm]
-        else:
-            batch_pos = train_pos
-
-        batch_neg = sample_train_negatives(full_mp_edge_index, data.num_nodes, batch_pos.size(1)).to(device)
-
-        pos_logits = model.decode(z, batch_pos)
-        neg_logits = model.decode(z, batch_neg)
-        labels = torch.cat([torch.ones_like(pos_logits), torch.zeros_like(neg_logits)], dim=0)
-        logits = torch.cat([pos_logits, neg_logits], dim=0)
-        loss = criterion(logits, labels)
-        loss.backward()
-        opt.step()
-
-        loss_value = float(loss.detach().cpu().item())
-        if loss_value < best_train_loss:
-            best_train_loss = loss_value
-            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
-            best_epoch = epoch
-            bad_epochs = 0
-        else:
-            bad_epochs += 1
-            if bad_epochs >= cfg.patience:
-                break
-
-    model.load_state_dict(best_state)
-    meta = {
-        "best_val_auc": float("nan"),
-        "best_train_loss": float(best_train_loss),
-        "best_epoch": float(best_epoch),
-        "num_layers": float(cfg.num_layers),
-        "hidden_dim": float(cfg.hidden_dim),
-        "dropout": float(cfg.dropout),
-        "lr": float(cfg.lr),
+    metrics = {
+        "lp/auc": float(test_auc),
+        "lp/score_sp_gap": float(test_sp),
+        "lp/score_sp_abs_gap": float(test_sp),
+        "lp/sp_gap": float(test_sp),
+        "lp/sp_abs_gap": float(test_sp),
+        "lp/eo_gap": float(test_eo),
+        "lp/eo_abs_gap": float(test_eo),
+        "lp/score_mean_sensitive": safe_group_mean(raw["scores"], raw["sens_mask"]),
+        "lp/score_mean_nonsensitive": safe_group_mean(raw["scores"], ~raw["sens_mask"]),
+        "lp/hard_rate_sensitive": float("nan"),
+        "lp/hard_rate_nonsensitive": float("nan"),
+        "lp/num_eval_pairs": float(split["test_mask"].sum().item()),
     }
-    return model, meta
+    meta = {
+        **best_meta,
+        "train_num_pos": float(split["num_train_pos"].item()),
+        "val_num_pos": float(split["num_val_pos"].item()),
+        "test_num_pos": float(split["num_test_pos"].item()),
+        "test_num_neg": float(split["num_test_neg"].item()),
+        "test_num_pairs": float(split["test_mask"].sum().item()),
+    }
+    return metrics, raw, meta
 
 
-def choose_best_lp_config_on_train_split(data: Data, split: Dict[str, torch.Tensor], args, seed: int) -> Tuple[LPTrialConfig, Dict[str, float]]:
-    search_space = build_search_space(args)
-    best_cfg = None
-    best_meta: Dict[str, float] = {}
-    best_val_auc = -1.0
-
-    for i, cfg in enumerate(search_space):
-        trial_seed = seed + 1000 * i
-        model, meta = train_gae_with_validation(data=data, split=split, cfg=cfg, seed=trial_seed)
-        val_auc = meta.get("best_val_auc", float("nan"))
-        if np.isfinite(val_auc) and val_auc > best_val_auc:
-            best_val_auc = float(val_auc)
-            best_cfg = cfg
-            best_meta = {
-                "lp_protocol": "gae_train_test",
-                "lp_model": cfg.backbone,
-                **meta,
-            }
-
-    if best_cfg is None:
-        raise RuntimeError("Failed to pick an LP config with finite inner validation AUC.")
-    return best_cfg, best_meta
-
-
-def train_lp_for_generated_graph(data: Data, split: Dict[str, torch.Tensor], args, seed: int) -> Tuple[DotProductGAE, Dict[str, float]]:
-    search_data = ensure_features(data)
-    if args.lp_search:
-        inner_split = build_inner_train_val_split(
-            train_pos=split["train_pos"],
-            full_pos=split["full_pos"],
-            num_nodes=search_data.num_nodes,
-            val_ratio=args.lp_val_ratio,
-            seed=seed,
-        )
-        cfg, meta = choose_best_lp_config_on_train_split(data=search_data, split=inner_split, args=args, seed=seed)
-    else:
-        cfg = build_search_space(args)[0]
-        meta = {
-            "lp_protocol": "gae_train_test",
-            "lp_model": cfg.backbone,
-            "best_val_auc": float("nan"),
-        }
-
-    model, train_meta = train_gae_on_train_split(data=search_data, split=split, cfg=cfg, seed=seed + 17)
-    meta.update(train_meta)
-    return model, meta
-
-
-def compute_binary_and_score_fairness(probs: np.ndarray, labels: np.ndarray, sens_mask: np.ndarray, threshold: float) -> Dict[str, float]:
-    probs = np.asarray(probs, dtype=float)
-    labels = np.asarray(labels, dtype=np.int64)
-    sens_mask = np.asarray(sens_mask, dtype=bool)
-
-    hard_pred = (probs >= threshold).astype(np.float32)
-    score_mean_sensitive = safe_group_mean(probs, sens_mask)
-    score_mean_nonsensitive = safe_group_mean(probs, ~sens_mask)
-    score_gap = safe_diff(score_mean_sensitive, score_mean_nonsensitive)
-
-    hard_rate_sensitive = safe_group_mean(hard_pred, sens_mask)
-    hard_rate_nonsensitive = safe_group_mean(hard_pred, ~sens_mask)
-    hard_gap = safe_diff(hard_rate_sensitive, hard_rate_nonsensitive)
-
-    pos_mask = labels == 1
-    eo_sensitive = safe_group_mean(hard_pred[pos_mask], sens_mask[pos_mask]) if pos_mask.any() else float("nan")
-    eo_nonsensitive = safe_group_mean(hard_pred[pos_mask], ~sens_mask[pos_mask]) if pos_mask.any() else float("nan")
-    eo_gap = safe_diff(eo_sensitive, eo_nonsensitive)
-
+def samplepy_aggregate_fairness(labels: np.ndarray, scores: np.ndarray, sens_mask: np.ndarray) -> Dict[str, float]:
+    sp, eo = samplepy_group_fairness(labels, scores, sens_mask)
     return {
-        "auc": safe_auc(labels, probs),
-        "score_sp_gap": score_gap,
-        "score_sp_abs_gap": safe_abs(score_gap),
-        "sp_gap": hard_gap,
-        "sp_abs_gap": safe_abs(hard_gap),
-        "eo_gap": eo_gap,
-        "eo_abs_gap": safe_abs(eo_gap),
-        "score_mean_sensitive": score_mean_sensitive,
-        "score_mean_nonsensitive": score_mean_nonsensitive,
-        "hard_rate_sensitive": hard_rate_sensitive,
-        "hard_rate_nonsensitive": hard_rate_nonsensitive,
+        "auc": safe_auc(labels, scores),
+        "score_sp_gap": sp,
+        "score_sp_abs_gap": sp,
+        "sp_gap": sp,
+        "sp_abs_gap": sp,
+        "eo_gap": eo,
+        "eo_abs_gap": eo,
+        "score_mean_sensitive": safe_group_mean(scores, sens_mask),
+        "score_mean_nonsensitive": safe_group_mean(scores, ~sens_mask),
+        "hard_rate_sensitive": float("nan"),
+        "hard_rate_nonsensitive": float("nan"),
         "num_eval_pairs": float(len(labels)),
     }
-
-
-def evaluate_lp_on_generated_test_pairs(
-    data: Data,
-    model: DotProductGAE,
-    train_mp_edge_index: torch.Tensor,
-    test_pos: torch.Tensor,
-    test_neg: torch.Tensor,
-    sensitive_attr: str,
-    sensitive_value: Optional[int],
-    edge_sensitive_mode: str,
-    threshold: float,
-    device: str,
-) -> Tuple[Dict[str, float], Dict[str, np.ndarray]]:
-    device_t = torch.device(device if torch.cuda.is_available() else "cpu")
-    data = ensure_features(data)
-    x = data.x.to(device_t)
-    train_mp_edge_index = train_mp_edge_index.to(device_t)
-
-    test_pos = test_pos.cpu()
-    test_neg = test_neg.cpu()
-    pair_edge_index = torch.cat([test_pos, test_neg], dim=1)
-    labels = np.concatenate([
-        np.ones(test_pos.size(1), dtype=np.int64),
-        np.zeros(test_neg.size(1), dtype=np.int64),
-    ])
-
-    model.eval()
-    with torch.no_grad():
-        z = model.encode(x, train_mp_edge_index)
-        logits = model.decode(z, pair_edge_index.to(device_t))
-        probs = torch.sigmoid(logits).cpu().numpy()
-
-    local_sensitive = get_local_sensitive_vector(data, sensitive_attr=sensitive_attr, sensitive_value=sensitive_value)
-    local_pairs = [tuple(map(int, e)) for e in pair_edge_index.t().tolist()]
-    sens_mask = pair_sensitive_mask_from_local_pairs(local_pairs, local_sensitive, mode=edge_sensitive_mode)
-
-    fair = compute_binary_and_score_fairness(probs, labels, sens_mask, threshold)
-    metrics = {f"lp/{k}": float(v) for k, v in fair.items()}
-    raw = {
-        "keep_idx": np.arange(len(labels), dtype=np.int64),
-        "labels": labels,
-        "scores": probs,
-        "sens_mask": sens_mask.astype(bool),
-    }
-    return metrics, raw
-
-
-def evaluate_lp_on_fixed_pairs(
-    data: Data,
-    model: DotProductGAE,
-    train_mp_edge_index: torch.Tensor,
-    reference_pairs: Sequence[Tuple[int, int]],
-    reference_labels: np.ndarray,
-    reference_node_sensitive: Dict[int, Any],
-    edge_sensitive_mode: str,
-    threshold: float,
-    device: str,
-) -> Tuple[Dict[str, float], Dict[str, np.ndarray]]:
-    device_t = torch.device(device if torch.cuda.is_available() else "cpu")
-    data = ensure_features(data)
-    x = data.x.to(device_t)
-    train_mp_edge_index = train_mp_edge_index.to(device_t)
-
-    _gids, g2l = global_id_mapping(data)
-    local_pairs: List[Tuple[int, int]] = []
-    keep_idx: List[int] = []
-    for i, (u, v) in enumerate(reference_pairs):
-        if u in g2l and v in g2l and u != v:
-            local_pairs.append((g2l[u], g2l[v]))
-            keep_idx.append(i)
-
-    if not local_pairs:
-        raise RuntimeError("No reference pairs mapped to this generated graph. Check orig_id alignment.")
-
-    pair_edge_index = torch.tensor(local_pairs, dtype=torch.long, device=device_t).t().contiguous()
-    model.eval()
-    with torch.no_grad():
-        z = model.encode(x, train_mp_edge_index)
-        logits = model.decode(z, pair_edge_index)
-        probs = torch.sigmoid(logits).cpu().numpy()
-
-    keep_idx_arr = np.asarray(keep_idx, dtype=np.int64)
-    labels = reference_labels[keep_idx_arr]
-    kept_pairs = [reference_pairs[i] for i in keep_idx]
-    sens_mask = pair_sensitive_mask(kept_pairs, reference_node_sensitive, mode=edge_sensitive_mode)
-
-    fair = compute_binary_and_score_fairness(probs, labels, sens_mask, threshold)
-    metrics = {f"lp/{k}": float(v) for k, v in fair.items()}
-    raw = {
-        "keep_idx": keep_idx_arr,
-        "labels": labels,
-        "scores": probs,
-        "sens_mask": sens_mask.astype(bool),
-    }
-    return metrics, raw
 
 
 # -----------------------------
@@ -1015,150 +716,86 @@ def ensemble_mean_scores(raw_results: List[Dict[str, np.ndarray]], full_num_pair
 
 
 # -----------------------------
-# Main
+# Evaluation
 # -----------------------------
 
-def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Evaluate saved generated graphs with overlap AUC and stronger GAE-style LP, save to CSV.")
-    p.add_argument("--graph_path", type=str, required=True, help="Path to *.pyg.pt or *.pyg_full.pt")
-    p.add_argument("--dataset", type=str, required=True, help="Dataset name used to find graphs/{dataset}_feat.pkl")
-    p.add_argument("--graph_index", type=int, default=None, help="Optional: evaluate only one graph from the saved list")
-    p.add_argument("--seed", type=int, default=0)
+def evaluate_graphs(
+    graphs: List[Any],
+    args: argparse.Namespace,
+    *,
+    reference_graph_path: Optional[str] = None,
+    total_loaded: Optional[int] = None,
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    set_seed(int(getattr(args, "seed", 0)))
 
-    p.add_argument("--sensitive_attr", type=str, default="y",
-                   help="Node attribute used to define same-label vs different-label pair groups.")
-    p.add_argument("--sensitive_value", type=int, default=None,
-                   help="Legacy no-op retained for backward compatibility.")
-    p.add_argument("--edge_sensitive_mode", type=str, default="either", choices=["either", "both"],
-                   help="Legacy no-op retained for backward compatibility.")
+    label_attr = getattr(args, "label_attr", None) or getattr(args, "sensitive_attr", None) or "y"
+    sensitive_attr = getattr(args, "sensitive_attr", None) or label_attr
+    max_pos_edges = int(getattr(args, "max_pos_edges", 20000))
+    neg_ratio = float(getattr(args, "neg_ratio", 1.0))
+    seed = int(getattr(args, "seed", 0))
 
-    p.add_argument("--max_pos_edges", type=int, default=20000, help="Max positive reference edges for overlap/reference LP pairs")
-    p.add_argument("--neg_ratio", type=float, default=1.0, help="Neg/pos ratio for fixed reference pairs")
+    if total_loaded is None:
+        total_loaded = len(graphs)
 
-    # LP / GAE protocol
-    p.add_argument("--lp_model", "--backbone", dest="lp_model", type=str, default="gcn", choices=["gcn", "sage", "gat"])
-    p.add_argument("--lp_num_layers", type=int, default=2)
-    p.add_argument("--lp_hidden_dim", type=int, default=128)
-    p.add_argument("--lp_out_dim", type=int, default=64)
-    p.add_argument("--lp_dropout", type=float, default=0.1)
-    p.add_argument("--lp_lr", type=float, default=1e-2)
-    p.add_argument("--lp_weight_decay", type=float, default=0.0)
-    p.add_argument("--lp_epochs", type=int, default=300)
-    p.add_argument("--lp_patience", type=int, default=30)
-    p.add_argument("--lp_batch_size", type=int, default=16384)
-    p.add_argument("--lp_test_ratio", type=float, default=0.2, help="Hold-out edge ratio for generated-graph train/test LP evaluation")
-    p.add_argument("--lp_val_ratio", type=float, default=0.2, help="Inner validation ratio used only when --lp_search is enabled")
-    p.add_argument("--gat_heads", type=int, default=4)
-    p.add_argument("--device", type=str, default="cuda:0")
-    p.add_argument("--threshold", type=float, default=0.5)
+    graph_index = getattr(args, "graph_index", None)
+    if graph_index is not None:
+        if graph_index < 0 or graph_index >= total_loaded:
+            raise IndexError(f"graph_index={graph_index} out of range for {total_loaded} graphs")
+        graphs = [graphs[graph_index]]
 
-    # optional hyperparameter search
-    p.add_argument("--lp_search", action="store_true", help="Search over a small validation grid instead of a single config")
-    p.add_argument("--lp_search_hidden_dims", type=int, nargs="+", default=[64, 128])
-    p.add_argument("--lp_search_lrs", type=float, nargs="+", default=[1e-2, 3e-3])
-    p.add_argument("--lp_search_dropouts", type=float, nargs="+", default=[0.0, 0.1, 0.2])
-    p.add_argument("--lp_search_num_layers", type=int, nargs="+", default=[1, 2])
+    if reference_graph_path is None:
+        reference_graph_path = str(Path.cwd() / "graphs" / f"{args.dataset}_feat.pkl")
 
-    p.add_argument("--out_per_graph_csv", type=str, default=None)
-    p.add_argument("--out_summary_csv", type=str, default=None)
-    return p.parse_args()
-
-
-def main() -> None:
-    args = parse_args()
-    set_seed(args.seed)
-
-    graph_path = Path(args.graph_path)
-    out_dir = graph_path.parent
-    stem = graph_path.name[:-3] if graph_path.name.endswith(".pt") else graph_path.name
-
-    if args.out_per_graph_csv is None:
-        args.out_per_graph_csv = str(out_dir / f"{stem}.overlap_lp_gae_per_graph.csv")
-    if args.out_summary_csv is None:
-        args.out_summary_csv = str(out_dir / f"{stem}.overlap_lp_gae_summary.csv")
-
-    graphs = load_saved_graphs(args.graph_path)
-    total_loaded = len(graphs)
-    if args.graph_index is not None:
-        if args.graph_index < 0 or args.graph_index >= total_loaded:
-            raise IndexError(f"graph_index={args.graph_index} out of range for {total_loaded} graphs")
-        graphs = [graphs[args.graph_index]]
-
-    g_ref = load_reference_graph_from_dataset(args.graph_path, args.dataset)
+    g_ref = load_reference_graph_from_dataset(reference_graph_path, args.dataset)
     reference_pairs, reference_labels = build_fixed_eval_pairs(
         g_ref,
-        max_pos_edges=args.max_pos_edges,
-        neg_ratio=args.neg_ratio,
-        seed=args.seed,
+        max_pos_edges=max_pos_edges,
+        neg_ratio=neg_ratio,
+        seed=seed,
     )
-    reference_node_sensitive = build_reference_node_sensitive_map(
-        g_ref,
-        sensitive_attr=args.sensitive_attr,
-        sensitive_value=args.sensitive_value,
-    )
+    reference_node_groups = build_reference_node_group_map(g_ref, sensitive_attr)
 
-    per_graph_rows: List[Dict[str, float]] = []
+    per_graph_rows: List[Dict[str, Any]] = []
     overlap_raw_rows: List[Dict[str, np.ndarray]] = []
     lp_raw_rows: List[Dict[str, np.ndarray]] = []
 
+    out_per_graph_csv = getattr(args, "out_per_graph_csv", None)
+
     for i, data in enumerate(graphs):
-        original_idx = args.graph_index if args.graph_index is not None else i
-        row: Dict[str, float] = {
+        original_idx = graph_index if graph_index is not None else i
+        row: Dict[str, Any] = {
             "graph_idx": float(original_idx),
-            "lp/model": args.lp_model,
-            "lp_protocol": "gae_train_test",
+            "lp/model": "samplepy_gae_1layer",
+            "lp_protocol": "samplepy_gae",
         }
 
         overlap_metrics, overlap_raw = edge_overlap_on_fixed_pairs(
             data=data,
             reference_pairs=reference_pairs,
             reference_labels=reference_labels,
-            reference_node_sensitive=reference_node_sensitive,
-            edge_sensitive_mode=args.edge_sensitive_mode,
+            reference_node_groups=reference_node_groups,
         )
         row.update(overlap_metrics)
         overlap_raw_rows.append(overlap_raw)
 
         try:
-            split = build_generated_graph_train_test_split(
-                data=data,
-                test_ratio=args.lp_test_ratio,
-                seed=args.seed + int(original_idx),
-            )
-            model, meta = train_lp_for_generated_graph(
-                data=data,
-                split=split,
-                args=args,
-                seed=args.seed + 100 * int(original_idx),
-            )
+            lp_metrics, lp_raw, meta = samplepy_train_and_eval(data, group_attr=sensitive_attr)
             row["lp/best_val_auc"] = float(meta.get("best_val_auc", float("nan")))
-            row["lp/best_train_loss"] = float(meta.get("best_train_loss", float("nan")))
             row["lp/best_epoch"] = float(meta.get("best_epoch", float("nan")))
-            row["lp/best_num_layers"] = float(meta.get("num_layers", float("nan")))
-            row["lp/best_hidden_dim"] = float(meta.get("hidden_dim", float("nan")))
-            row["lp/best_dropout"] = float(meta.get("dropout", float("nan")))
-            row["lp/best_lr"] = float(meta.get("lr", float("nan")))
-            row["lp/train_num_pos"] = float(split["train_pos"].size(1))
-            row["lp/test_num_pos"] = float(split["test_pos"].size(1))
-            row["lp/test_num_neg"] = float(split["test_neg"].size(1))
-
-            lp_metrics, lp_raw = evaluate_lp_on_generated_test_pairs(
-                data=data,
-                model=model,
-                train_mp_edge_index=split["train_mp_edge_index"],
-                test_pos=split["test_pos"],
-                test_neg=split["test_neg"],
-                sensitive_attr=args.sensitive_attr,
-                sensitive_value=args.sensitive_value,
-                edge_sensitive_mode=args.edge_sensitive_mode,
-                threshold=args.threshold,
-                device=args.device,
-            )
+            row["lp/best_num_layers"] = float(meta.get("best_num_layers", 1.0))
+            row["lp/best_hidden_dim"] = float(meta.get("best_hidden_dim", float("nan")))
+            row["lp/best_dropout"] = float(meta.get("best_dropout", float("nan")))
+            row["lp/best_lr"] = float(meta.get("best_lr", float("nan")))
+            row["lp/train_num_pos"] = float(meta.get("train_num_pos", float("nan")))
+            row["lp/val_num_pos"] = float(meta.get("val_num_pos", float("nan")))
+            row["lp/test_num_pos"] = float(meta.get("test_num_pos", float("nan")))
+            row["lp/test_num_neg"] = float(meta.get("test_num_neg", float("nan")))
+            row["lp/test_num_pairs"] = float(meta.get("test_num_pairs", float("nan")))
             row.update(lp_metrics)
             lp_raw_rows.append(lp_raw)
-        except Exception as e:
-            row["lp/error"] = str(e)
-            for k in [
+        except Exception as exc:
+            row["lp/error"] = str(exc)
+            for key in [
                 "lp/auc",
                 "lp/score_sp_gap",
                 "lp/score_sp_abs_gap",
@@ -1172,47 +809,48 @@ def main() -> None:
                 "lp/hard_rate_nonsensitive",
                 "lp/num_eval_pairs",
                 "lp/best_val_auc",
-                "lp/best_train_loss",
                 "lp/best_epoch",
                 "lp/best_num_layers",
                 "lp/best_hidden_dim",
                 "lp/best_dropout",
                 "lp/best_lr",
                 "lp/train_num_pos",
+                "lp/val_num_pos",
                 "lp/test_num_pos",
                 "lp/test_num_neg",
+                "lp/test_num_pairs",
             ]:
-                row[k] = float("nan")
+                row[key] = float("nan")
 
         add_compat_metric_aliases(row)
         per_graph_rows.append(row)
-        write_csv(per_graph_rows, Path(args.out_per_graph_csv))
+        if out_per_graph_csv:
+            write_csv(per_graph_rows, Path(out_per_graph_csv))
 
-    summary: Dict[str, float] = {
+    summary: Dict[str, Any] = {
         "num_loaded_graphs": float(total_loaded),
         "num_evaluated_graphs": float(len(per_graph_rows)),
         "reference_num_pairs": float(len(reference_pairs)),
         "reference_pos_pairs": float(reference_labels.sum()),
         "reference_neg_pairs": float((reference_labels == 0).sum()),
-        "lp/model": args.lp_model,
-        "lp_protocol": "gae_train_test",
-        "lp_search": float(bool(args.lp_search)),
-        "lp_test_ratio": float(args.lp_test_ratio),
-        "lp_val_ratio": float(args.lp_val_ratio),
+        "lp/model": "samplepy_gae_1layer",
+        "lp_protocol": "samplepy_gae",
+        "lp_search": 1.0,
+        "lp_split": "samplepy_prepare_for_GAE_80_10_10",
     }
 
-    numeric_keys = []
+    numeric_keys: List[str] = []
     seen = set()
     for row in per_graph_rows:
-        for k, v in row.items():
-            if isinstance(v, (int, float, np.floating)) and k not in seen:
-                seen.add(k)
-                numeric_keys.append(k)
+        for key, value in row.items():
+            if isinstance(value, (int, float, np.floating)) and key not in seen:
+                seen.add(key)
+                numeric_keys.append(key)
 
-    for k in numeric_keys:
-        vals = [float(r[k]) for r in per_graph_rows if k in r]
-        summary[f"{k}_mean"] = safe_mean(vals)
-        summary[f"{k}_std"] = safe_std(vals)
+    for key in numeric_keys:
+        vals = [float(row[key]) for row in per_graph_rows if key in row]
+        summary[f"{key}_mean"] = safe_mean(vals)
+        summary[f"{key}_std"] = safe_std(vals)
 
     overlap_mean_scores, overlap_valid = ensemble_mean_scores(overlap_raw_rows, len(reference_pairs))
     if overlap_valid.sum() > 0:
@@ -1220,30 +858,94 @@ def main() -> None:
         summary["ensemble_overlap/coverage_pairs"] = float(overlap_valid.sum())
 
     if lp_raw_rows:
-        # Important: this remains a convenience aggregate of scores from different trained models.
-        # Prefer lp/auc_mean and lp/*_mean for model-selection and reporting.
         all_lp_labels = np.concatenate([r["labels"] for r in lp_raw_rows], axis=0)
         all_lp_scores = np.concatenate([r["scores"] for r in lp_raw_rows], axis=0)
         all_lp_sens = np.concatenate([r["sens_mask"] for r in lp_raw_rows], axis=0)
-        agg_lp = compute_binary_and_score_fairness(
-            probs=all_lp_scores,
-            labels=all_lp_labels,
-            sens_mask=all_lp_sens,
-            threshold=args.threshold,
-        )
-        for k, v in agg_lp.items():
-            summary[f"aggregate_lp/{k}"] = v
+        agg_lp = samplepy_aggregate_fairness(all_lp_labels, all_lp_scores, all_lp_sens)
+        for key, value in agg_lp.items():
+            summary[f"aggregate_lp/{key}"] = value
         summary["aggregate_lp/num_graphs"] = float(len(lp_raw_rows))
 
     add_compat_metric_aliases(summary)
-    if "aggregate_lp/score_sp_gap" in summary and "aggregate_fair_gap" not in summary:
-        summary["aggregate_fair_gap"] = float(summary["aggregate_lp/score_sp_gap"])
-    if "aggregate_lp/score_sp_abs_gap" in summary and "aggregate_fair_abs_gap" not in summary:
-        summary["aggregate_fair_abs_gap"] = float(summary["aggregate_lp/score_sp_abs_gap"])
-    if "ensemble_overlap/auc" in summary and "ensemble_value/linkpred_auc" not in summary:
-        summary["ensemble_value/linkpred_auc"] = float(summary["ensemble_overlap/auc"])
+    if "aggregate_lp/sp_gap" in summary and "aggregate_fair_gap" not in summary:
+        summary["aggregate_fair_gap"] = float(summary["aggregate_lp/sp_gap"])
+    if "aggregate_lp/sp_abs_gap" in summary and "aggregate_fair_abs_gap" not in summary:
+        summary["aggregate_fair_abs_gap"] = float(summary["aggregate_lp/sp_abs_gap"])
+    if "aggregate_lp/auc" in summary and "aggregate_value/linkpred_auc" not in summary:
+        summary["aggregate_value/linkpred_auc"] = float(summary["aggregate_lp/auc"])
 
-    write_csv([summary], Path(args.out_summary_csv))
+    out_summary_csv = getattr(args, "out_summary_csv", None)
+    if out_summary_csv:
+        write_csv([summary], Path(out_summary_csv))
+
+    return per_graph_rows, summary
+
+
+# -----------------------------
+# CLI
+# -----------------------------
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Evaluate saved generated graphs with sample.py-compatible GAE link prediction.")
+    parser.add_argument("--graph_path", type=str, required=True, help="Path to *.pyg.pt or *.pyg_full.pt")
+    parser.add_argument("--dataset", type=str, required=True, help="Dataset name used to find graphs/{dataset}_feat.pkl")
+    parser.add_argument("--graph_index", type=int, default=None, help="Optional: evaluate only one graph from the saved list")
+    parser.add_argument("--seed", type=int, default=0)
+
+    parser.add_argument("--label_attr", type=str, default="y")
+    parser.add_argument("--sensitive_attr", type=str, default=None)
+    parser.add_argument("--sensitive_value", type=int, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--edge_sensitive_mode", type=str, default="either", choices=["either", "both"], help=argparse.SUPPRESS)
+
+    parser.add_argument("--max_pos_edges", type=int, default=20000, help="Max positive reference edges for overlap evaluation pairs")
+    parser.add_argument("--neg_ratio", type=float, default=1.0, help="Neg/pos ratio for fixed reference pairs")
+
+    # Legacy arguments accepted for compatibility with existing grid scripts.
+    parser.add_argument("--lp_model", "--backbone", dest="lp_model", type=str, default="samplepy_gae")
+    parser.add_argument("--lp_num_layers", type=int, default=1)
+    parser.add_argument("--lp_hidden_dim", type=int, default=128)
+    parser.add_argument("--lp_out_dim", type=int, default=64)
+    parser.add_argument("--lp_dropout", type=float, default=0.1)
+    parser.add_argument("--lp_lr", type=float, default=1e-2)
+    parser.add_argument("--lp_weight_decay", type=float, default=0.0)
+    parser.add_argument("--lp_epochs", type=int, default=1000)
+    parser.add_argument("--lp_patience", type=int, default=5)
+    parser.add_argument("--lp_batch_size", type=int, default=16384)
+    parser.add_argument("--lp_test_ratio", type=float, default=0.1, help="Legacy no-op; sample.py split is fixed at 80/10/10.")
+    parser.add_argument("--lp_val_ratio", type=float, default=0.1, help="Legacy no-op; sample.py split is fixed at 80/10/10.")
+    parser.add_argument("--gat_heads", type=int, default=4)
+    parser.add_argument("--device", type=str, default="cuda:0")
+    parser.add_argument("--threshold", type=float, default=0.5)
+    parser.add_argument("--lp_search", action="store_true", help="Legacy no-op; sample.py GAE grid is always used.")
+    parser.add_argument("--lp_search_hidden_dims", type=int, nargs="+", default=[16, 32, 128, 512])
+    parser.add_argument("--lp_search_lrs", type=float, nargs="+", default=[3e-2, 1e-2, 3e-3, 1e-3])
+    parser.add_argument("--lp_search_dropouts", type=float, nargs="+", default=[0.0, 0.1, 0.2])
+    parser.add_argument("--lp_search_num_layers", type=int, nargs="+", default=[1])
+
+    parser.add_argument("--out_per_graph_csv", type=str, default=None)
+    parser.add_argument("--out_summary_csv", type=str, default=None)
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    graph_path = Path(args.graph_path)
+    out_dir = graph_path.parent
+    stem = graph_path.name[:-3] if graph_path.name.endswith(".pt") else graph_path.name
+
+    if args.out_per_graph_csv is None:
+        args.out_per_graph_csv = str(out_dir / f"{stem}.overlap_lp_gae_per_graph.csv")
+    if args.out_summary_csv is None:
+        args.out_summary_csv = str(out_dir / f"{stem}.overlap_lp_gae_summary.csv")
+
+    graphs = load_saved_graphs(args.graph_path)
+    _per_graph_rows, summary = evaluate_graphs(
+        graphs=graphs,
+        args=args,
+        reference_graph_path=args.graph_path,
+        total_loaded=len(graphs),
+    )
+    print(summary)
 
 
 if __name__ == "__main__":
