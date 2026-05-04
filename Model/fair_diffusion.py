@@ -169,11 +169,11 @@ class FairLossE(nn.Module):
         fair_loss_E : torch.Tensor
             Scalar representing the fairness loss between pair groups.
         """
-        
+
         fair_loss_E = torch.pow(torch.sum(logit_E[:,1] * M_chi) - torch.sum(logit_E[:,1] * M_omega),2)
 
         return fair_loss_E
-        
+
 
 class BaseModel(nn.Module):
     """
@@ -462,6 +462,7 @@ class BaseModel(nn.Module):
                 pred_E_func,
                 t_float,
                 X_t_one_hot,
+                edge_node_features,
                 s_0,
                 E_t,
                 Q_t_E,
@@ -484,6 +485,7 @@ class BaseModel(nn.Module):
                                        A_t,
                                        s_0,
                                        Y_0,
+                                       edge_node_features,
                                        batch_src,
                                        batch_dst
                                        )
@@ -732,12 +734,14 @@ class ModelSync(BaseModel):
         if not is_diffuse_X:
             X_t_one_hot = X_one_hot_3d.transpose(0, 1) 
             X_t_one_hot = X_t_one_hot.reshape(X_t_one_hot.size(0), -1)
+        edge_node_features = X_one_hot_3d[..., 1].transpose(0, 1)
 
         logit_X, logit_E = self.graph_encoder(t_float,
                                               X_t_one_hot,
                                               A_t,
                                               s,
                                               y,
+                                              edge_node_features,
                                               batch_src,
                                               batch_dst)
         loss_X = self.loss_X(X_one_hot_3d, logit_X)
@@ -861,6 +865,7 @@ class ModelSync(BaseModel):
             if not is_diff_X:
                 X_t_one_hot = X_one_hot_3d.transpose(0, 1) 
                 X_t_one_hot = X_t_one_hot.reshape(X_t_one_hot.size(0), -1)
+            edge_node_features = X_one_hot_3d[..., 1].transpose(0, 1)
                 
             A_t = self.get_adj(E_t)
             logit_X, logit_E = self.graph_encoder(t_float,
@@ -868,6 +873,7 @@ class ModelSync(BaseModel):
                                                   A_t,
                                                   s,
                                                   y,
+                                                  edge_node_features,
                                                   batch_src,
                                                   batch_dst)
 
@@ -994,11 +1000,13 @@ class ModelSync(BaseModel):
         if fixed_X_one_hot_3d is not None:
             X_t_one_hot = fixed_X_one_hot_3d.transpose(0, 1)
             X_t_one_hot = X_t_one_hot.reshape(self.num_nodes, -1)
+            edge_node_features = fixed_X_one_hot_3d[..., 1].transpose(0, 1)
         else:
             # (F, |V|, 2)
             X_prior = self.X_marginal[:, None, :].expand(-1, self.num_nodes, -1) # You should change this for different initializations of X
             # (|V|, 2F)
             X_t_one_hot = self.sample_X(X_prior)
+            edge_node_features = None
 
         # Iteratively sample p(D^s | D^t) for t = 1, ..., T, with s = t - 1.
         for s in tqdm(list(reversed(range(0, self.T)))):
@@ -1026,6 +1034,7 @@ class ModelSync(BaseModel):
                                     self.graph_encoder.pred_E,
                                     t_float,
                                     X_input_one_hot,
+                                    edge_node_features,
                                     s_0,
                                     E_t,
                                     Q_t_E,

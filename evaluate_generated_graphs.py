@@ -17,6 +17,7 @@ FairWire_feature use the same measurement structure without importing sample.py.
 
 import argparse
 import csv
+import inspect
 import itertools
 import math
 import pickle
@@ -180,8 +181,15 @@ def global_id_mapping(data) -> Tuple[List[int], Dict[int, int]]:
 # Graph loading / reference pairs
 # -----------------------------
 
+def torch_load_unrestricted(path: str, map_location: str = "cpu") -> Any:
+    kwargs: Dict[str, Any] = {"map_location": map_location}
+    if "weights_only" in inspect.signature(torch.load).parameters:
+        kwargs["weights_only"] = False
+    return torch.load(path, **kwargs)
+
+
 def load_saved_graphs(graph_path: str) -> List[Any]:
-    obj = torch.load(graph_path, map_location="cpu", weights_only=False)
+    obj = torch_load_unrestricted(graph_path, map_location="cpu")
     graphs = obj if isinstance(obj, list) else [obj]
     if not graphs:
         raise ValueError(f"No graphs found in {graph_path}")

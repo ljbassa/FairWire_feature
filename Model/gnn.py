@@ -196,7 +196,10 @@ class GNNTower(nn.Module):
                  node_mode,
                  num_classes_Y,
                  class_info,
-                 hidden_Y=None
+                 hidden_Y=None,
+                 inject_node_features=False,
+                 node_feat_dropout=0.0,
+                 node_feat_mask_prob=0.0,
                  ):
         super().__init__()
         self.class_info = class_info
@@ -204,6 +207,9 @@ class GNNTower(nn.Module):
         in_X = num_attrs_X * num_classes_X
         self.num_attrs_X = num_attrs_X
         self.num_classes_X = num_classes_X
+        self.inject_node_features = inject_node_features
+        self.node_feat_dropout = float(node_feat_dropout)
+        self.node_feat_mask_prob = float(node_feat_mask_prob)
 
         self.mlp_in_t = nn.Sequential(
             nn.Linear(1, hidden_t),
@@ -216,6 +222,9 @@ class GNNTower(nn.Module):
             nn.Linear(hidden_X, hidden_X),
             nn.ReLU()
         )
+        if self.inject_node_features:
+            self.node_feat_in = nn.Linear(num_attrs_X, hidden_X)
+            self.node_feat_dropout_layer = nn.Dropout(p=self.node_feat_dropout)
         self.emb_s = nn.Embedding(num_classes_s, hidden_s)
         if class_info:
             self.emb_Y = nn.Embedding(num_classes_Y, hidden_Y)
@@ -241,17 +250,35 @@ class GNNTower(nn.Module):
             nn.Linear(hidden_cat, hidden_cat),
             nn.ReLU(),
             nn.Linear(hidden_cat, out_size))
-            
+
+    def _inject_node_features(self, h_X, node_features):
+        if not self.inject_node_features or node_features is None:
+            return h_X
+
+        projected_x = self.node_feat_in(node_features.float())
+        if self.training:
+            if self.node_feat_dropout > 0:
+                projected_x = self.node_feat_dropout_layer(projected_x)
+            if self.node_feat_mask_prob > 0:
+                keep_prob = 1.0 - self.node_feat_mask_prob
+                mask = torch.bernoulli(
+                    torch.full((projected_x.size(0), 1), keep_prob, device=projected_x.device)
+                )
+                projected_x = projected_x * mask
+        return h_X + projected_x
+
     def forward(self,
                 t_float,
                 X_t_one_hot,
                 A_t,
                 s_real,
-                Y_real):
+                Y_real,
+                node_features=None):
         # Input projection.
         # (1, hidden_t)
         h_t = self.mlp_in_t(t_float).unsqueeze(0)
         h_X = self.mlp_in_X(X_t_one_hot)
+        h_X = self._inject_node_features(h_X, node_features)
         h_s = self.emb_s(s_real)
         
         h_X_list = [h_X]
@@ -336,7 +363,10 @@ class LinkPredictor(nn.Module):
                  num_gnn_layers,
                  dropout,
                  num_classes_Y,
-                 hidden_Y=None):
+                 hidden_Y=None,
+                 use_node_feat=True,
+                 node_feat_dropout=0.0,
+                 node_feat_mask_prob=0.0):
         super().__init__()
         if num_classes_Y is not None:
             class_info = True
@@ -354,7 +384,10 @@ class LinkPredictor(nn.Module):
                                     num_classes_Y=num_classes_Y,
                                     hidden_Y=hidden_Y,
                                     class_info=class_info,
-                                    node_mode=False)
+                                    node_mode=False,
+                                    inject_node_features=use_node_feat,
+                                    node_feat_dropout=node_feat_dropout,
+                                    node_feat_mask_prob=node_feat_mask_prob)
         self.mlp_out = nn.Sequential(
             nn.Linear(hidden_E, hidden_E),
             nn.ReLU(),
@@ -367,6 +400,7 @@ class LinkPredictor(nn.Module):
                 A_t,
                 s_real,
                 Y_real,
+                node_features,
                 src,
                 dst):
         # (|V|, hidden_E)
@@ -374,7 +408,8 @@ class LinkPredictor(nn.Module):
                              X_t_one_hot,
                              A_t,
                              s_real,
-                             Y_real)
+                             Y_real,
+                             node_features=node_features)
         # (|E|, hidden_E)
         h = h[src] * h[dst]
         # (|E|, num_classes_E)
@@ -441,6 +476,7 @@ class GNN(nn.Module):
                 A_t,
                 s_real,
                 Y,
+                edge_node_features,
                 batch_src,
                 batch_dst):
         """
@@ -477,6 +513,7 @@ class GNN(nn.Module):
                               A_t,
                               s_real,
                               Y,
+                              edge_node_features,
                               batch_src,
                               batch_dst)
 
